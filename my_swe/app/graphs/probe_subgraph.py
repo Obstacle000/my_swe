@@ -221,7 +221,7 @@ async def _execute_tool_with_context(
         if not logs:
             return f"未找到 trace_id={t_args.get('trace_id')} 对应的链路日志。"
         return json.dumps(logs, ensure_ascii=False, indent=2)
-
+    # 以下是测试用于访问数据源的工具,有点丑陋,删的化记得也把deps,repo,lifespan,依赖注入也删了
     if t_name == "inspect_table_schema":
         return mall_probe_repo.get_table_ddl(t_args.get("table_name", "all"))
 

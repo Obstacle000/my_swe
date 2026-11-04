@@ -59,7 +59,7 @@ def build_evidence(source: str, tool_name: str, query_args: dict, raw_output: st
 
 #### 工具集 1：ES 运行时日志探针工具（`app/tools/log_tools.py`）
 > **挂载对象**：仅挂载给 `probe_type == "log"` 的 `ProbeWorkerState` 探针子图。  
-> **证据来源标识**：`source = "es_log"`
+> **证据来源标识**：`error_log`（报错日志/堆栈）与 `trace_log`（链路上下文日志），兼容向后别名 `es_log`。
 
 ##### 1. `search_error_logs`
 * **函数签名**：
@@ -100,6 +100,7 @@ def build_evidence(source: str, tool_name: str, query_args: dict, raw_output: st
 
 #### 工具集 2：本地代码库与 Git 探针工具（`app/tools/code_tools.py`）
 > **挂载对象**：仅挂载给 `probe_type == "code"` 的 `ProbeWorkerState` 探针子图。  
+> **证据来源标识**：`source_code`（源码行窗口）、`code_search`（正则/关键词搜索）、`git_history`（历史变更与 Blame），兼容向后别名 `codebase`。
 > **吸收设计**：结合 `open-swe` 的 `FILE_TOOLS` 与 `SWE-agent` 的行号滑动窗口（ACI）。  
 > **安全红线**：所有文件路径必须经过 `_safe_resolve(repo_root, relative_path)` 校验（确保 `target_path.is_relative_to(repo_root)`），严禁大模型通过 `../../` 越权读取项目目录以外的电脑私人文件！
 
@@ -163,6 +164,7 @@ def build_evidence(source: str, tool_name: str, query_args: dict, raw_output: st
 
 #### 工具集 3：MySQL 数据库只读核验工具（`app/tools/db_tools.py`）
 > **挂载对象**：仅挂载给 `probe_type == "db"` 的 `ProbeWorkerState` 探针子图。  
+> **证据来源标识**：`db_schema`（数据表 DDL/结构字段）与 `db_record`（只读 SQL 查询记录），兼容向后别名 `mysql_db`。
 > **安全红线**：必须通过正则 `^\s*SELECT\b` 校验且禁止包含 `UPDATE|DELETE|INSERT|DROP|ALTER|TRUNCATE` 关键字，强制使用只读数据库账号连接！
 
 ##### 1. `inspect_table_schema`
@@ -275,40 +277,23 @@ def build_evidence(source: str, tool_name: str, query_args: dict, raw_output: st
        ]
    ```
 5. **`context_compressor_node`（证据汇总与上下文折叠节点）**：
-   * 所有并行的 `probe_worker_subgraph` 跑完后，它们查到的 `evidence_ledger` 和 `gaps` 已通过 `operator.add` 自动合并到了主图；
-   * 本节点让大模型根据新收集到的 `evidence_ledger`，将各个 `Hypothesis.assessment` 更新为 `"supported"`（已证实）或 `"rejected"`（已排除），并递增 `probe_round += 1`。
-6. **`route_after_compressor`（判断是否需要第二轮深挖）**：
-   * 若已有假设被标记为 `"supported"`（已锁定确凿根因）或 `probe_round >= 2` $\rightarrow$ 进入 `draft_report_node`；
-   * 若第一轮只查了日志拿到了报错文件名，还没看具体代码 $\rightarrow$ 跳回 `hypothesis_planner_node` 开启第 2 轮代码与数据库探针。
-7. **`draft_report_node`（填写 `ReportDraft` 草稿）**：
-   * 加载汉化版 `report.md` 排障五步法提示词，把 `evidence_ledger` 里的所有真实证据编号与摘要列给大模型，强制调用 `llm.with_structured_output(ReportDraft)` 生成报告草稿。
-8. **`verify_report_node`（复刻 `open-swe` 的代码级防幻觉验钞机）**：
-   ```python
-   def verify_report_node(state: IncidentMainState) -> dict:
-       draft: ReportDraft = state["report_draft"]
-       known_ids = {ev.id for ev in state["evidence_ledger"]}
-       
-       # 检查核心根因 (cause) 是否为空或引用了不存在的伪造 evidence_id
-       invalid_citations = [
-           cid for claim in draft.cause for cid in claim.evidence_ids if cid not in known_ids
-       ]
-       missing_evidence = any(len(claim.evidence_ids) == 0 for claim in draft.cause)
-   
-       if (invalid_citations or missing_evidence) and state["verify_retry_count"] < 2:
-           # 抓到幻觉！递增重试计数，记录警告并通过条件边打回给 draft_report_node 重写
-           return {
-               "verify_retry_count": state["verify_retry_count"] + 1,
-               "gaps": [f"检测到未绑定真实证据或伪造证据ID {invalid_citations}，已拦截打回重填"],
-           }
-   
-       # 验钞通过：调用 finalize_report() 拼接角标、计算 fingerprint 指纹，生成正式 IncidentReport
-       final_report = finalize_report(draft, state["evidence_ledger"], state["gaps"])
-       return {"final_report": final_report}
-   ```
-9. **`route_after_verifier`（验钞后路由）**：
-   * 若 `state.get("final_report") is None`（说明刚被验钞机拦截打回了） $\rightarrow$ 跳回 `draft_report_node`；
-   * 若验钞通过且 `final_report.need_code_patch == True` $\rightarrow$ 进入子图 3 `patch_self_heal_subgraph` 生成代码补丁；
-   * 若 `need_code_patch == False`（比如只是外部限流配置问题或待用户补充线索） $\rightarrow$ 直接结束 (`END`)。
+   * 所有并行的 `probe_worker_subgraph` 跑完后，它们查到的 `evidence` 和 `gaps` 已通过 `operator.add` 自动合并到了主图；
+   * 本节点让大模型根据新收集到的真实证据，将各个 `Hypothesis.assessment` 更新为 `"supported"`（已证实）或 `"rejected"`（已排除），并递增 `loop_count += 1`。
+6. **`evidence_evaluate_node` & `route_after_evaluate`（证据质量与闭环评估独立节点）**：
+   * **职责**：独立评估当前证据链条是否足以形成确定性的根因闭环（或 `loop_count >= 2` 达到上限）；
+   * **不足分支**：若证据不充分且未达上限，生成明确指导意见写入 `evaluate_retry_reason` 并打回给 `hypothesis_planner_node` 开启第 2 轮针对性取证；
+   * **充分/上限分支**：直接进入 `generate_report_node` 开始起草根因报告。
+7. **`generate_report_node`（报告起草生成节点）**：
+   * 加载 `incident_report.md` 规范提示词，结合全量有效证据池与历史复发案例，由 LLM 输出结构化草稿 `ReportDraft`（每句结论必须绑定真实 `evidence_ids`）；
+   * 底层搭载纯动态兜底提取器 `_build_grounded_report_draft`（0 硬编码），从证据池提取事实兜底。
+8. **`verify_report_node`（防幻觉验钞机节点）**：
+   * 严格核验 `ReportDraft` 中引用的所有 `evidence_id` 是否真实存在于全局 `evidence` 账本白名单中，拦截伪造与凭空捏造；
+   * 伪造或缺失证据时写入 `verification_error` 打回重写（最多重试 2 次）；
+   * 验钞通过后正式签发 `IncidentReport` 并计算 64 位 SHA-256 幂等指纹 `digest`。
+9. **`route_after_verifier`（验钞后自愈决策边）**：
+   * 若 `state.get("final_report") is None` $\rightarrow$ 携带错误反馈打回 `generate_report_node`；
+   * 若验钞通过且 `final_report.need_code_patch == True` $\rightarrow$ 派发至子图 3 `patch_self_heal_subgraph`；
+   * 若 `need_code_patch == False` $\rightarrow$ 直接跳过沙箱补丁环节，进入 `apply_and_evolve_node`（或结束）。
 10. **`human_approval_node`（LangGraph `interrupt` 人工审批节点）**：
     ```python
     from langgraph.types import interrupt

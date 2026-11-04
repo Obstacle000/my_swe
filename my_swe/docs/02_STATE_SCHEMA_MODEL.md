@@ -10,25 +10,31 @@
 class IncidentMainState(TypedDict):
     # 1. 基础输入与提取出的线索
     incident_id: str
+    target_project_id: str                                   # 排查目标工作区 ID
     user_query: str                                          # 用户的原始提问
     extracted_clues: dict[str, str]                          # 提炼出的 user_id, trace_id, url 等
     messages: Annotated[list[AnyMessage], add_messages]      # 主图消息历史
 
-    # 2. 排障核心数据（里面装的就是上面定义的 BaseModel 对象！）
+    # 2. 排障核心数据与证据流
     historical_cases: list[dict]                             # 历史库检索子图返回的结果
     hypotheses: list[Hypothesis]                             # 当前提出的所有假设列表
-    evidence_ledger: Annotated[list[Evidence], operator.add] # 各探针子图汇总上来的真实证据池
+    evidence: Annotated[list[Evidence], operator.add]        # 各探针子图汇总上来的真实证据池 (8大来源)
+    evidence_ledger: NotRequired[list[dict[str, Any]]]       # 面向 Planner / Worker 跨轮流转的证据摘要总账
     gaps: Annotated[list[str], operator.add]                 # 各探针汇总上来的排查盲区
+    evaluate_retry_reason: NotRequired[str]                  # 证据评估打回重试指导意见 (解耦于 gaps)
+    loop_count: int                                          # 排障循环轮次计数器 (上限 2 轮)
 
     # 3. 报告与防幻觉校验状态
     report_draft: ReportDraft | None                         # 大模型交上来的草稿
     final_report: IncidentReport | None                      # 验钞通过后的正式报告
+    verification_error: NotRequired[str | None]              # 验钞失败错误堆栈 (用于打回重写)
     verify_retry_count: int                                  # 防幻觉打回重填次数
 
     # 4. 代码修复与人工审批状态
     patch_diff: str | None                                   # 代码修复子图生成的 Diff 补丁
     test_passed: bool                                        # 沙箱单测是否通过
     human_approval: Literal["pending", "approved", "rejected"] # 人工审批状态
+    human_feedback: NotRequired[str | None]                  # 人工审批驳回反馈意见
 ```
 
 **第一组：基础输入与线索字段**
@@ -196,10 +202,11 @@ class CRAGSubState(TypedDict):
 ```py
 class ProbeWorkerState(TypedDict):
     hypothesis: Hypothesis                                   # 主图派发给当前子图要验证的那 1 个假设
-    worker_messages: Annotated[list[AnyMessage], add_messages] # 子图自己调工具（ls/grep/read_file/sql）的对话过程，不污染主图！
-    remaining_chars: int                                     # 当前探针的字符预算上限
+    worker_messages: Annotated[list[AnyMessage], add_messages] # 子图私有工具调用消息流 (隔离不污染主图)
+    remaining_chars: int                                     # 当前探针的字符预算上限 (15000)
+    known_facts: NotRequired[list[str]]                      # 跨特工/跨轮次已知既成事实摘要 (防止重复取证)
     # 子图跑完后，自动通过 operator.add 合并回主图 IncidentMainState 的字段：
-    evidence_ledger: Annotated[list[Evidence], operator.add]
+    evidence: Annotated[list[Evidence], operator.add]
     gaps: Annotated[list[str], operator.add]
 ```
 
