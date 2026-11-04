@@ -92,3 +92,53 @@ def test_full_langgraph_workflow_and_hitl_resume():
         config=config,
     )
     assert resumed["human_approval"] == "approved"
+
+
+def test_fastapi_rest_and_sse_endpoints():
+    from fastapi.testclient import TestClient
+    from app.main import app
+
+    with TestClient(app) as client:
+        # 1. 健康检查
+        r_health = client.get("/health")
+        assert r_health.status_code == 200
+        assert r_health.json()["code"] == 200
+
+        # 2. 靶场注入故障
+        r_fault = client.post("/api/v1/range/trigger-fault", json={"scenario_id": "case_2_vip_discount_bug"})
+        assert r_fault.status_code == 200
+        fault_data = r_fault.json()["data"]
+        assert fault_data["scenario_id"] == "case_2_vip_discount_bug"
+
+        # 3. 调试 RRF 混合检索接口
+        r_rrf = client.post("/api/v1/knowledge/search-debug", json={"query": "ReadTimeoutError send-sms", "top_k": 2})
+        assert r_rrf.status_code == 200
+        assert r_rrf.json()["data"]["results"][0]["incident_code"] == "INC-2026-089"
+
+        # 4. 创建排障会话 -> 发起 SSE 流式排障 -> 人工审批通过
+        r_create = client.post(
+            "/api/v1/incidents",
+            json={
+                "workspace_id": "ws_mall_prod",
+                "trigger_source": "user_chat",
+                "initial_query": fault_data["suggested_prompt"],
+            },
+        )
+        assert r_create.status_code == 200
+        inc_id = r_create.json()["data"]["incident_id"]
+
+        r_stream = client.post(
+            f"/api/v1/incidents/{inc_id}/chat-stream",
+            json={"message": fault_data["suggested_prompt"]},
+        )
+        assert r_stream.status_code == 200
+        assert "event: report_verified" in r_stream.text
+        assert "event: hitl_interrupt" in r_stream.text
+
+        r_approve = client.post(
+            f"/api/v1/incidents/{inc_id}/approval",
+            json={"decision": "approved", "feedback": "LGTM"},
+        )
+        assert r_approve.status_code == 200
+        assert r_approve.json()["data"]["new_status"] == "resolved"
+
