@@ -3,7 +3,7 @@
 from sqlalchemy import JSON, Boolean, Float, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 from app.config import now_iso
-from app.models.database import Base, MallBase
+from app.models.base import Base
 
 
 class WorkspaceModel(Base):
@@ -111,9 +111,9 @@ KnowledgeRunbookModel = HistoricalRunbookModel
 
 
 # ============================================================================
-# 被排查电商靶场业务表 (MallBase -> mall_target.db)
+# 被排查电商靶场业务表 (mall_users, mall_coupons, mall_orders)
 # ============================================================================
-class MallUserModel(MallBase):
+class MallUserModel(Base):
     """电商靶场用户表 (mall_users)"""
 
     __tablename__ = "mall_users"
@@ -125,7 +125,7 @@ class MallUserModel(MallBase):
     status: Mapped[str] = mapped_column(String(16), default="ACTIVE")
 
 
-class MallCouponModel(MallBase):
+class MallCouponModel(Base):
     """电商靶场优惠券表 (mall_coupons)"""
 
     __tablename__ = "mall_coupons"
@@ -138,7 +138,7 @@ class MallCouponModel(MallBase):
     status: Mapped[str] = mapped_column(String(16), default="UNUSED")
 
 
-class MallOrderModel(MallBase):
+class MallOrderModel(Base):
     """电商靶场订单流水表 (mall_orders)"""
 
     __tablename__ = "mall_orders"

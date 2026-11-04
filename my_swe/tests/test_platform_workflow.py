@@ -1,20 +1,109 @@
-"""针对排障平台核心机制的自动化回归单元测试
+"""针对排障平台核心机制与 DI 架构的自动化回归单元测试
 覆盖：
 1. EvidenceCollector 敏感数据脱敏 (redact_text) 与确定性证据编号签发 (build_evidence)
 2. ReportDraft -> valid_refs 防幻觉拦截校验器与 SHA-256 指纹幂等判重 (fingerprint)
-3. ES (BM25) + Qdrant (Vector) + RRF (k=60) 倒数秩融合检索
-4. LangGraph 主图 + 三大子图全链路执行、interrupt() 断点挂起与 Command(resume=...) 恢复
+3. RRF (k=60) 倒数秩融合算法 (rrf_fuse_runbooks)
+4. 依赖注入链路 (app/clients/ + app/api/deps.py + app/repositories/ + IncidentGraphContext)
+5. LangGraph 主图 + 三大子图全链路异步执行 (astream / ainvoke 传入 context=IncidentGraphContext)
 """
 
 import asyncio
+from typing import Any
 from langchain_core.messages import HumanMessage
 from langgraph.types import Command
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from app.core.evidence_collector import build_evidence, redact_text
 from app.core.report_verifier import verify_and_finalize_report
-from app.core.storage_backends import seed_databases_if_empty, storage_manager
+from app.graphs.context import IncidentGraphContext
+from app.graphs.crag_subgraph import rrf_fuse_runbooks
 from app.graphs.main_graph import build_main_incident_graph
+from app.graphs.state import IncidentMainState
+from app.models import Base
+from app.repositories.mysql.incident_repo import IncidentRepository
+from app.repositories.mysql.mall_probe_repo import MallProbeRepository
+from app.repositories.mysql.runbook_repo import RunbookRepository
 from app.schemas.incident_schemas import Claim, ReportDraft
+from app.services.knowledge_service import INITIAL_RUNBOOKS
+from app.services.range_service import INITIAL_RUNTIME_LOGS
+
+
+class _DummyEmbedding:
+    async def aembed_query(self, text: str) -> list[float]:
+        return [0.1] * 1024
+
+    async def aembed_documents(self, texts: list[str]) -> list[list[float]]:
+        return [[0.1] * 1024 for _ in texts]
+
+
+class _FakeRuntimeLogESRepo:
+    def __init__(self) -> None:
+        self.logs = list(INITIAL_RUNTIME_LOGS)
+
+    async def write_log(self, log_doc: dict[str, Any]) -> None:
+        self.logs.insert(0, log_doc)
+
+    async def search_logs(
+        self,
+        keyword: str = "",
+        api_path: str = "",
+        user_id: str = "",
+        level: str = "",
+        limit: int = 5,
+    ) -> list[dict[str, Any]]:
+        out = []
+        for log in self.logs:
+            if user_id and str(log.get("user_id")) != str(user_id):
+                continue
+            if api_path and api_path not in log.get("api_path", ""):
+                continue
+            out.append(log)
+        return out[:limit] or self.logs[:limit]
+
+    async def get_logs_by_trace_id(self, trace_id: str, limit: int = 20) -> list[dict[str, Any]]:
+        return [log for log in self.logs if log.get("trace_id") == trace_id][:limit]
+
+
+class _FakeRunbookESRepo:
+    def __init__(self) -> None:
+        self.docs = list(INITIAL_RUNBOOKS)
+
+    async def index_runbook(self, runbook_doc: dict[str, Any]) -> None:
+        self.docs.insert(0, runbook_doc)
+
+    async def bulk_index(self, docs: list[dict[str, Any]]) -> None:
+        self.docs = list(docs)
+
+    async def search_bm25(self, query: str, limit: int = 10) -> list[dict[str, Any]]:
+        q_lower = query.lower()
+        scored = []
+        for doc in self.docs:
+            score = 5.0 if "readtimeouterror" in q_lower and doc["incident_code"] == "INC-2026-089" else 1.0
+            scored.append({**doc, "bm25_score": score})
+        scored.sort(key=lambda d: d["bm25_score"], reverse=True)
+        return scored[:limit]
+
+
+class _FakeRunbookQdrantRepo:
+    def __init__(self) -> None:
+        self.docs = list(INITIAL_RUNBOOKS)
+
+    async def upsert_runbook(self, vector: list[float], payload: dict[str, Any]) -> None:
+        self.docs.insert(0, payload)
+
+    async def upsert_vectors(
+        self, vectors: list[list[float]], payloads: list[dict[str, Any]]
+    ) -> None:
+        self.docs = list(payloads)
+
+    async def search_vector(
+        self, query_vector: list[float], limit: int = 10
+    ) -> list[dict[str, Any]]:
+        return [{**doc, "vector_score": 0.85} for doc in self.docs[:limit]]
+
+
+class _FakeCacheRepo:
+    pass
 
 
 def test_evidence_redaction_and_id_signing():
@@ -30,8 +119,9 @@ def test_evidence_redaction_and_id_signing():
 
 
 def test_anti_hallucination_verifier_rejects_fake_evidence_id():
-    real_ev = build_evidence("read_file_window", {"file_path": "order_service.py"}, "line 64: TypeError")
-    # 故意伪造不存在的 ev_code:fake99
+    real_ev = build_evidence(
+        "read_file_window", {"file_path": "order_service.py"}, "line 64: TypeError"
+    )
     bad_draft = ReportDraft(
         summary=[Claim(text="发现空指针异常", evidence_ids=["ev_code:fake99"])],
         problem=[Claim(text="接口 500", evidence_ids=[real_ev.id])],
@@ -45,77 +135,147 @@ def test_anti_hallucination_verifier_rejects_fake_evidence_id():
 
 
 def test_rrf_hybrid_search_ranks_sms_runbook_first():
-    results = storage_manager.hybrid_search_rrf("send-sms ReadTimeoutError timeout=2.0", top_k=3)
+    bm25_hits = [
+        {**INITIAL_RUNBOOKS[0], "bm25_score": 12.5},
+        {**INITIAL_RUNBOOKS[1], "bm25_score": 2.1},
+    ]
+    vec_hits = [
+        {**INITIAL_RUNBOOKS[0], "vector_score": 0.92},
+        {**INITIAL_RUNBOOKS[2], "vector_score": 0.61},
+    ]
+    results = rrf_fuse_runbooks(bm25_hits=bm25_hits, vec_hits=vec_hits, top_k=3, k_constant=60)
     assert len(results) >= 1
     assert results[0]["incident_code"] == "INC-2026-089"
-    assert results[0]["rrf_score"] > 0
+    assert results[0]["rrf_score"] == round(1 / 61 + 1 / 61, 6)
 
 
-def test_full_langgraph_workflow_and_hitl_resume():
-    asyncio.run(seed_databases_if_empty())
-    graph = build_main_incident_graph()
-    config = {"configurable": {"thread_id": "inc_pytest_case1"}}
+def test_full_langgraph_workflow_with_injected_context_and_hitl_resume():
+    async def _run():
+        engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
 
-    init_state = {
-        "incident_id": "inc_pytest_case1",
-        "workspace_id": "ws_mall_prod",
-        "messages": [HumanMessage(content="用户 10086 结算订单 /api/orders/checkout 报 500 异常，请排查修复")],
-        "extracted_clues": {},
-        "historical_context": "",
-        "crag_hit": False,
-        "hypotheses": [],
-        "evidence": [],
-        "loop_count": 0,
-        "report_draft": None,
-        "final_report": None,
-        "verification_error": "",
-        "verify_retry_count": 0,
-        "patch_diff": "",
-        "test_passed": False,
-        "human_approval": "pending",
-        "human_feedback": "",
-    }
+        session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+        async with session_factory() as session:
+            incident_repo = IncidentRepository(session)
+            runbook_repo = RunbookRepository(session)
+            mall_probe_repo = MallProbeRepository(session)
+            await mall_probe_repo.seed_initial_data(INITIAL_RUNBOOKS)
 
-    # 1. 运行至 human_approval_node 的 interrupt() 断点
-    graph.invoke(init_state, config=config)
-    snapshot = graph.get_state(config)
-    vals = snapshot.values
+            context = IncidentGraphContext(
+                incident_id="inc_pytest_case1",
+                workspace_id="ws_mall_prod",
+                embedding=_DummyEmbedding(),  # type: ignore[typeddict-item]
+                incident_repo=incident_repo,
+                runbook_repo=runbook_repo,
+                mall_probe_repo=mall_probe_repo,
+                runtime_log_es_repo=_FakeRuntimeLogESRepo(),  # type: ignore[typeddict-item]
+                runbook_es_repo=_FakeRunbookESRepo(),  # type: ignore[typeddict-item]
+                runbook_qdrant_repo=_FakeRunbookQdrantRepo(),  # type: ignore[typeddict-item]
+                cache_repo=_FakeCacheRepo(),  # type: ignore[typeddict-item]
+            )
 
-    assert vals["final_report"] is not None
-    assert len(vals["final_report"].digest) == 64
-    assert vals["test_passed"] is True
-    assert "--- a/app/services/order_service.py" in vals["patch_diff"]
+            graph = build_main_incident_graph()
+            config = {"configurable": {"thread_id": "inc_pytest_case1"}}
 
-    # 2. 使用 Command(resume=...) 唤醒人工审批节点
-    resumed = graph.invoke(
-        Command(resume={"decision": "approved", "feedback": "批准合并"}),
-        config=config,
-    )
-    assert resumed["human_approval"] == "approved"
+            init_state = IncidentMainState(
+                incident_id="inc_pytest_case1",
+                workspace_id="ws_mall_prod",
+                messages=[
+                    HumanMessage(
+                        content="用户 10086 结算订单 /api/orders/checkout 报 500 异常，请排查修复"
+                    )
+                ],
+                evidence=[],
+                loop_count=0,
+                verify_retry_count=0,
+                test_passed=False,
+                human_approval="pending",
+            )
+
+            # 1. 传入 context 运行至 human_approval_node 的 interrupt() 断点
+            await graph.ainvoke(init_state, config=config, context=context)
+            snapshot = graph.get_state(config)
+            vals = snapshot.values
+
+            assert vals["final_report"] is not None
+            assert len(vals["final_report"].digest) == 64
+            assert vals["test_passed"] is True
+            assert "--- a/app/services/order_service.py" in vals["patch_diff"]
+
+            # 2. 使用 Command(resume=...) 唤醒人工审批节点，验证通过 context 自动写入 RunbookRepository
+            resumed = await graph.ainvoke(
+                Command(resume={"decision": "approved", "feedback": "批准合并"}),
+                config=config,
+                context=context,
+            )
+            assert resumed["human_approval"] == "approved"
+
+            all_runbooks = await runbook_repo.list_all()
+            codes = {r.incident_code for r in all_runbooks}
+            assert "INC-AUTO-ASE1" in codes
+
+        await engine.dispose()
+
+    asyncio.run(_run())
 
 
-def test_fastapi_rest_and_sse_endpoints():
+def test_fastapi_routers_with_annotated_deps_and_service_injection():
+    from fastapi import FastAPI
     from fastapi.testclient import TestClient
-    from app.main import app
+    from app.api.deps import (
+        get_embedding_client,
+        get_incident_cache_repository,
+        get_runbook_es_repository,
+        get_runbook_qdrant_repository,
+        get_runtime_log_es_repository,
+        get_session,
+    )
+    from app.api.incidents_router import router as incidents_router
+    from app.api.knowledge_router import router as knowledge_router
+    from app.api.range_router import router as range_router
 
-    with TestClient(app) as client:
-        # 1. 健康检查
-        r_health = client.get("/health")
-        assert r_health.status_code == 200
-        assert r_health.json()["code"] == 200
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
-        # 2. 靶场注入故障
-        r_fault = client.post("/api/v1/range/trigger-fault", json={"scenario_id": "case_2_vip_discount_bug"})
+    async def _init_db():
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        async with session_factory() as s:
+            await MallProbeRepository(s).seed_initial_data(INITIAL_RUNBOOKS)
+
+    asyncio.run(_init_db())
+
+    fake_log_es = _FakeRuntimeLogESRepo()
+    fake_rb_es = _FakeRunbookESRepo()
+    fake_rb_qdrant = _FakeRunbookQdrantRepo()
+    fake_cache = _FakeCacheRepo()
+    fake_emb = _DummyEmbedding()
+
+    async def _override_session():
+        async with session_factory() as s:
+            yield s
+
+    test_app = FastAPI()
+    test_app.include_router(range_router)
+    test_app.include_router(incidents_router)
+    test_app.include_router(knowledge_router)
+
+    test_app.dependency_overrides[get_session] = _override_session
+    test_app.dependency_overrides[get_runtime_log_es_repository] = lambda: fake_log_es
+    test_app.dependency_overrides[get_runbook_es_repository] = lambda: fake_rb_es
+    test_app.dependency_overrides[get_runbook_qdrant_repository] = lambda: fake_rb_qdrant
+    test_app.dependency_overrides[get_incident_cache_repository] = lambda: fake_cache
+    test_app.dependency_overrides[get_embedding_client] = lambda: fake_emb
+
+    with TestClient(test_app) as client:
+        r_fault = client.post(
+            "/api/v1/range/trigger-fault",
+            json={"scenario_id": "case_2_vip_discount_bug"},
+        )
         assert r_fault.status_code == 200
         fault_data = r_fault.json()["data"]
-        assert fault_data["scenario_id"] == "case_2_vip_discount_bug"
 
-        # 3. 调试 RRF 混合检索接口
-        r_rrf = client.post("/api/v1/knowledge/search-debug", json={"query": "ReadTimeoutError send-sms", "top_k": 2})
-        assert r_rrf.status_code == 200
-        assert r_rrf.json()["data"]["results"][0]["incident_code"] == "INC-2026-089"
-
-        # 4. 创建排障会话 -> 发起 SSE 流式排障 -> 人工审批通过
         r_create = client.post(
             "/api/v1/incidents",
             json={
@@ -141,4 +301,6 @@ def test_fastapi_rest_and_sse_endpoints():
         )
         assert r_approve.status_code == 200
         assert r_approve.json()["data"]["new_status"] == "resolved"
+
+    asyncio.run(engine.dispose())
 

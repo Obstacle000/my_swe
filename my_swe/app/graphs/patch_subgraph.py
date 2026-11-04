@@ -1,9 +1,4 @@
-"""子图三：沙箱代码修复与单测自愈子图 (PatchSelfHealSubgraph)
-包含节点：
-1. init_worktree_node (创建与正式目录物理隔离的沙箱副本目录)
-2. generate_patch_node (调用 edit_file_in_sandbox 生成修复代码并提取 Unified Diff)
-3. run_pytest_node (在沙箱内运行真实 pytest 单元测试，若失败则带着报错堆栈回环自愈重试，最多 3 次)
-"""
+"""子图三：沙箱代码修复与单测自愈子图 (PatchSelfHealSubgraph)"""
 
 import difflib
 import shutil
@@ -13,8 +8,10 @@ from pathlib import Path
 from typing import Literal
 from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.graph import END, START, StateGraph
+from langgraph.runtime import Runtime
 
 from app.config import PROJECT_ROOT, get_llm, settings
+from app.graphs.context import IncidentGraphContext
 from app.graphs.state import PatchSelfHealSubState
 from app.prompts.loader import load_prompt
 from app.tools.sandbox_tools import SANDBOX_TOOLS, edit_file_in_sandbox
@@ -25,7 +22,9 @@ def _has_valid_llm_key() -> bool:
     return bool(key) and not key.startswith("sk-your-") and key != "sk-placeholder"
 
 
-def init_worktree_node(state: PatchSelfHealSubState) -> dict:
+async def init_worktree_node(
+    state: PatchSelfHealSubState, runtime: Runtime[IncidentGraphContext]
+) -> dict:
     """创建隔离沙箱目录并将被排查业务仓库完整复制进去，保护主工作区不被直接篡改"""
     inc_id = state.get("incident_id", "inc_default")
     sandbox_root = PROJECT_ROOT / ".sandboxes" / inc_id
@@ -42,7 +41,9 @@ def init_worktree_node(state: PatchSelfHealSubState) -> dict:
     }
 
 
-def generate_patch_node(state: PatchSelfHealSubState) -> dict:
+async def generate_patch_node(
+    state: PatchSelfHealSubState, runtime: Runtime[IncidentGraphContext]
+) -> dict:
     """根据 IncidentReport 根因与上一轮 pytest 失败报错，在隔离沙箱中修改源码并生成 Unified Diff"""
     sandbox_dir = state["sandbox_dir"]
     report = state["report"]
@@ -65,10 +66,12 @@ def generate_patch_node(state: PatchSelfHealSubState) -> dict:
         try:
             sys_prompt = load_prompt(
                 "patch_coder.md.jinja",
+                report_summary=report.summary,
                 cause=report.cause,
                 next_steps="\n".join(report.next_steps),
                 retry_count=retry_count,
                 test_error_log=prev_error,
+                human_feedback=state.get("human_feedback", ""),
             )
             user_msg = (
                 f"沙箱根目录 `sandbox_dir`: `{sandbox_dir}`\n"
@@ -77,7 +80,9 @@ def generate_patch_node(state: PatchSelfHealSubState) -> dict:
                 "请直接调用 `edit_file_in_sandbox` 工具完成修复。"
             )
             llm_coder = get_llm(temperature=0.0).bind_tools(SANDBOX_TOOLS)
-            ai_msg = llm_coder.invoke([SystemMessage(content=sys_prompt), HumanMessage(content=user_msg)])
+            ai_msg = await llm_coder.ainvoke(
+                [SystemMessage(content=sys_prompt), HumanMessage(content=user_msg)]
+            )
             for tc in getattr(ai_msg, "tool_calls", None) or []:
                 if tc["name"] == "edit_file_in_sandbox":
                     res = str(edit_file_in_sandbox.invoke(tc["args"]))
@@ -89,7 +94,6 @@ def generate_patch_node(state: PatchSelfHealSubState) -> dict:
     if not applied_via_llm:
         _apply_deterministic_sandbox_fix(sandbox_dir, rel_target)
 
-    # 计算正式仓库原文件与沙箱修复后文件的标准 Unified Diff
     patch_diff = _compute_unified_diff(
         orig_root=settings.default_target_repo_path,
         sandbox_root=Path(sandbox_dir),
@@ -140,8 +144,16 @@ def _apply_deterministic_sandbox_fix(sandbox_dir: str, rel_target: str) -> None:
 def _compute_unified_diff(orig_root: Path, sandbox_root: Path, rel_path: str) -> str:
     orig_file = orig_root / rel_path
     sand_file = sandbox_root / rel_path
-    orig_lines = orig_file.read_text(encoding="utf-8").splitlines(keepends=True) if orig_file.exists() else []
-    sand_lines = sand_file.read_text(encoding="utf-8").splitlines(keepends=True) if sand_file.exists() else []
+    orig_lines = (
+        orig_file.read_text(encoding="utf-8").splitlines(keepends=True)
+        if orig_file.exists()
+        else []
+    )
+    sand_lines = (
+        sand_file.read_text(encoding="utf-8").splitlines(keepends=True)
+        if sand_file.exists()
+        else []
+    )
 
     diff = difflib.unified_diff(
         orig_lines,
@@ -153,13 +165,14 @@ def _compute_unified_diff(orig_root: Path, sandbox_root: Path, rel_path: str) ->
     return "".join(diff)
 
 
-def run_pytest_node(state: PatchSelfHealSubState) -> dict:
+async def run_pytest_node(
+    state: PatchSelfHealSubState, runtime: Runtime[IncidentGraphContext]
+) -> dict:
     """在隔离沙箱目录中拉起子进程执行真实 pytest 单元测试验证"""
     sandbox_dir = state["sandbox_dir"]
     target_files = state.get("target_files", [])
     is_pricing = any("pricing_service" in f for f in target_files)
 
-    # 针对当前修复的模块执行对应的回归测试集
     k_expr = (
         "test_vip_level_2_gold_member_discount"
         if is_pricing
@@ -209,8 +222,10 @@ def _route_after_pytest(
 
 
 def build_patch_subgraph():
-    """构建并编译沙箱自愈编码子图"""
-    builder = StateGraph(PatchSelfHealSubState)
+    """构建并编译带 IncidentGraphContext 上下文 Schema 的沙箱自愈编码子图"""
+    builder = StateGraph(
+        state_schema=PatchSelfHealSubState, context_schema=IncidentGraphContext
+    )
     builder.add_node("init_worktree_node", init_worktree_node)
     builder.add_node("generate_patch_node", generate_patch_node)
     builder.add_node("run_pytest_node", run_pytest_node)

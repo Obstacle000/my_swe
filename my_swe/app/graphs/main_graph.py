@@ -1,10 +1,6 @@
 """排障主图编排模块 (IncidentMainGraph)
-串联 11 个核心节点与 3 大子图 (CRAGSubgraph / ProbeWorkerSubgraph / PatchSelfHealSubgraph)，
-实现：
-1. Send API 动态并行探针派发与 operator.add 证据归并
-2. ReportDraft -> valid_refs 防幻觉证据校验打回闭环 + SHA-256 结论指纹去重
-3. interrupt() 人工审批挂起 (HITL) 与 Command(resume=...) 唤醒恢复
-4. 故障结案后自动写入历史经验库 (Self-Evolving Post-mortem)
+通过 StateGraph(state_schema=IncidentMainState, context_schema=IncidentGraphContext) 声明运行期依赖上下文，
+所有节点通过 Runtime[IncidentGraphContext] 获取请求级注入的 Repository 实例，彻底解耦数据库直接实例化。
 """
 
 import json
@@ -13,15 +9,21 @@ from typing import Literal
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
+from langgraph.runtime import Runtime
 from langgraph.types import Send, interrupt
 
 from app.config import get_llm, settings
 from app.core.report_verifier import verify_and_finalize_report
-from app.core.storage_backends import storage_manager
+from app.graphs.context import IncidentGraphContext
 from app.graphs.crag_subgraph import crag_subgraph
 from app.graphs.patch_subgraph import patch_subgraph
 from app.graphs.probe_subgraph import probe_subgraph
-from app.graphs.state import IncidentMainState, ProbeWorkerState
+from app.graphs.state import (
+    CRAGSubState,
+    IncidentMainState,
+    PatchSelfHealSubState,
+    ProbeWorkerState,
+)
 from app.prompts.loader import load_prompt
 from app.schemas.incident_schemas import (
     Claim,
@@ -48,21 +50,26 @@ def _latest_user_query(state: IncidentMainState) -> str:
 # ============================================================================
 # 节点 1: triage_node (自然语言意图分诊与结构化线索提取)
 # ============================================================================
-def triage_node(state: IncidentMainState) -> dict:
+async def triage_node(
+    state: IncidentMainState, runtime: Runtime[IncidentGraphContext]
+) -> dict:
     user_text = _latest_user_query(state)
 
     if _has_valid_llm_key():
         try:
             sys_prompt = load_prompt("triage.md")
             llm_triage = get_llm(temperature=0.0).with_structured_output(TriageClues)
-            clues_obj: TriageClues = llm_triage.invoke(
+            clues_obj: TriageClues = await llm_triage.ainvoke(
                 [SystemMessage(content=sys_prompt), HumanMessage(content=user_text)]
             )
-            return {"extracted_clues": clues_obj.model_dump(), "loop_count": 0, "verify_retry_count": 0}
+            return {
+                "extracted_clues": clues_obj.model_dump(),
+                "loop_count": 0,
+                "verify_retry_count": 0,
+            }
         except Exception:
             pass
 
-    # 确定性正则与语义线索提取兜底
     uid_match = re.search(r"\b(1008[6-9]|\d{4,8})\b", user_text)
     api_match = re.search(r"(/api/[a-zA-Z0-9_\-/]+)", user_text)
     user_id = uid_match.group(1) if uid_match else ""
@@ -100,24 +107,26 @@ def triage_node(state: IncidentMainState) -> dict:
 
 
 # ============================================================================
-# 节点 2: crag_subgraph_node (调用子图一：CRAG 历史故障双路混合检索)
+# 节点 2: crag_subgraph_node (调用子图一：CRAG 历史故障双路混合检索，透传 runtime.context)
 # ============================================================================
-def crag_subgraph_node(state: IncidentMainState) -> dict:
+async def crag_subgraph_node(
+    state: IncidentMainState, runtime: Runtime[IncidentGraphContext]
+) -> dict:
     clues = state.get("extracted_clues", {})
     user_text = _latest_user_query(state)
-    combined_query = f"{user_text} {clues.get('api_path', '')} {clues.get('error_keyword', '')}".strip()
+    combined_query = (
+        f"{user_text} {clues.get('api_path', '')} {clues.get('error_keyword', '')}".strip()
+    )
 
-    sub_res = crag_subgraph.invoke(
-        {
-            "original_query": combined_query,
-            "current_query": combined_query,
-            "retrieved_docs": [],
-            "relevant_docs": [],
-            "retry_count": 0,
-            "historical_context": "",
-            "crag_hit": False,
-            "evidence": [],
-        }
+    sub_res = await crag_subgraph.ainvoke(
+        CRAGSubState(
+            original_query=combined_query,
+            current_query=combined_query,
+            retry_count=0,
+            crag_hit=False,
+            evidence=[],
+        ),
+        context=runtime.context,
     )
     return {
         "historical_context": sub_res.get("historical_context", ""),
@@ -129,7 +138,9 @@ def crag_subgraph_node(state: IncidentMainState) -> dict:
 # ============================================================================
 # 节点 3: hypothesis_planner_node (动态生成 1~3 个并行排障假设)
 # ============================================================================
-def hypothesis_planner_node(state: IncidentMainState) -> dict:
+async def hypothesis_planner_node(
+    state: IncidentMainState, runtime: Runtime[IncidentGraphContext]
+) -> dict:
     clues = state.get("extracted_clues", {})
     hist_ctx = state.get("historical_context", "")
     crag_hit = state.get("crag_hit", False)
@@ -143,7 +154,7 @@ def hypothesis_planner_node(state: IncidentMainState) -> dict:
                 f"【CRAG 历史故障检索结果 (crag_hit={crag_hit})】：\n{hist_ctx}\n"
             )
             planner_llm = get_llm(temperature=0.0).with_structured_output(HypothesisPlanList)
-            plan: HypothesisPlanList = planner_llm.invoke(
+            plan: HypothesisPlanList = await planner_llm.ainvoke(
                 [SystemMessage(content=sys_prompt), HumanMessage(content=user_ctx)]
             )
             if plan.hypotheses:
@@ -151,7 +162,6 @@ def hypothesis_planner_node(state: IncidentMainState) -> dict:
         except Exception:
             pass
 
-    # 确定性多维度排障假设拆解
     mod_hint = clues.get("module_hint", "order")
     if crag_hit or mod_hint == "sms":
         hypotheses = [
@@ -211,43 +221,38 @@ def hypothesis_planner_node(state: IncidentMainState) -> dict:
 # ============================================================================
 def _dispatch_probe_workers(state: IncidentMainState) -> list[Send]:
     clues = state.get("extracted_clues", {})
-    sends: list[Send] = []
-    for h in state.get("hypotheses", []):
-        sends.append(
-            Send(
-                "probe_worker_node",
-                {
-                    "hypothesis": h,
-                    "clues": clues,
-                    "worker_messages": [],
-                    "remaining_chars": 15000,
-                    "evidence": [],
-                },
-            )
+    return [
+        Send(
+            "probe_worker_node",
+            ProbeWorkerState(
+                hypothesis=h,
+                clues=clues,
+                worker_messages=[],
+                remaining_chars=15000,
+                evidence=[],
+            ),
         )
-    return sends
+        for h in state.get("hypotheses", [])
+    ]
 
 
 # ============================================================================
-# 节点 4: probe_worker_node (执行子图二：单假设探针验证并将签发证据合并回主图)
+# 节点 4: probe_worker_node (执行子图二：单假设探针验证，透传 runtime.context)
 # ============================================================================
-def probe_worker_node(state: ProbeWorkerState) -> dict:
-    sub_res = probe_subgraph.invoke(state)
+async def probe_worker_node(
+    state: ProbeWorkerState, runtime: Runtime[IncidentGraphContext]
+) -> dict:
+    sub_res = await probe_subgraph.ainvoke(state, context=runtime.context)
     return {"evidence": sub_res.get("evidence", [])}
 
 
 # ============================================================================
 # 节点 5: evidence_evaluate_node (评估并行探针归并后的证据池充分性)
 # ============================================================================
-def evidence_evaluate_node(state: IncidentMainState) -> dict:
-    # 去重证据池 (保持顺序)
-    seen_ids: set[str] = set()
-    unique_ev: list[Evidence] = []
-    for ev in state.get("evidence", []):
-        if ev.id not in seen_ids:
-            seen_ids.add(ev.id)
-            unique_ev.append(ev)
-    return {"evidence": []}  # operator.add 保持原列表，无需重复追加
+async def evidence_evaluate_node(
+    state: IncidentMainState, runtime: Runtime[IncidentGraphContext]
+) -> dict:
+    return {"evidence": []}
 
 
 def _route_after_evaluate(
@@ -262,7 +267,9 @@ def _route_after_evaluate(
 # ============================================================================
 # 节点 6: generate_report_node (生成强制绑定真实证据 ID 的 ReportDraft)
 # ============================================================================
-def generate_report_node(state: IncidentMainState) -> dict:
+async def generate_report_node(
+    state: IncidentMainState, runtime: Runtime[IncidentGraphContext]
+) -> dict:
     clues = state.get("extracted_clues", {})
     ev_pool = _dedup_evidences(state.get("evidence", []))
     hypotheses = state.get("hypotheses", [])
@@ -284,14 +291,13 @@ def generate_report_node(state: IncidentMainState) -> dict:
                 user_prompt += f"\n\n【上一轮防幻觉校验打回原因，请立即修正】：\n{verify_err}\n"
 
             report_llm = get_llm(temperature=0.0).with_structured_output(ReportDraft)
-            draft: ReportDraft = report_llm.invoke(
+            draft: ReportDraft = await report_llm.ainvoke(
                 [SystemMessage(content=sys_prompt), HumanMessage(content=user_prompt)]
             )
             return {"report_draft": draft}
         except Exception:
             pass
 
-    # 确定性构建绑定真实 Evidence ID 的 ReportDraft
     draft = _build_grounded_report_draft(clues, hypotheses, ev_pool)
     return {"report_draft": draft}
 
@@ -311,10 +317,12 @@ def _build_grounded_report_draft(
     hypotheses: list[Hypothesis],
     ev_pool: list[Evidence],
 ) -> ReportDraft:
-    """基于探针采集到的真实 Evidence 对象构建有据可查的 ReportDraft"""
     all_ids = [ev.id for ev in ev_pool]
     log_ids = [ev.id for ev in ev_pool if ev.id.startswith("ev_log:")] or all_ids[:1]
-    code_ids = [ev.id for ev in ev_pool if ev.id.startswith(("ev_code:", "ev_git:"))] or all_ids[:1]
+    code_ids = (
+        [ev.id for ev in ev_pool if ev.id.startswith(("ev_code:", "ev_git:"))]
+        or all_ids[:1]
+    )
     db_ids = [ev.id for ev in ev_pool if ev.id.startswith("ev_db:")] or all_ids[:1]
     hist_ids = [ev.id for ev in ev_pool if ev.id.startswith("ev_hist:")] or log_ids
 
@@ -420,7 +428,6 @@ def _build_grounded_report_draft(
             need_code_patch=True,
         )
 
-    # 默认剧本一: 优惠券 NoneType 500 故障
     return ReportDraft(
         summary=[
             Claim(
@@ -463,7 +470,9 @@ def _build_grounded_report_draft(
 # ============================================================================
 # 节点 7: verify_report_node (防幻觉证据校验器 valid_refs + SHA-256 指纹去重)
 # ============================================================================
-def verify_report_node(state: IncidentMainState) -> dict:
+async def verify_report_node(
+    state: IncidentMainState, runtime: Runtime[IncidentGraphContext]
+) -> dict:
     draft = state.get("report_draft")
     ev_pool = _dedup_evidences(state.get("evidence", []))
     inc_id = state.get("incident_id", "inc_default")
@@ -488,9 +497,37 @@ def verify_report_node(state: IncidentMainState) -> dict:
             "verify_retry_count": retry_cnt + 1,
         }
 
+    fallback_markdown = (
+        f"### 排障报告已生成 (`{inc_id}`)\n\n"
+        f"- **核心结论**：{report.summary}\n"
+        f"- **故障现象**：{report.problem}\n"
+        f"- **确凿根因**：{report.cause}\n"
+        f"- **修复与处置步骤**：{'; '.join(report.next_steps)}\n"
+        f"- **报告防伪指纹 (SHA-256)**：`{report.digest}`"
+    )
+
+    assistant_reply: AIMessage | None = None
+    if _has_valid_llm_key():
+        try:
+            summary_llm = get_llm(temperature=0.1)
+            summary_prompt = (
+                "你是 SRE 排障专家。请基于以下已通过防幻觉校验的正式排障报告，用简洁清晰的 Markdown 向用户输出最终排障结论汇报"
+                "（保留报告中的 [证据引用: ev_xxx] 标记，不要编造任何报告之外的信息）：\n\n"
+                f"{fallback_markdown}"
+            )
+            ai_resp = await summary_llm.ainvoke([HumanMessage(content=summary_prompt)])
+            if ai_resp and ai_resp.content:
+                assistant_reply = AIMessage(content=str(ai_resp.content))
+        except Exception:
+            assistant_reply = None
+
+    if assistant_reply is None:
+        assistant_reply = AIMessage(content=fallback_markdown)
+
     return {
         "final_report": report,
         "verification_error": "",
+        "messages": [assistant_reply],
     }
 
 
@@ -501,11 +538,14 @@ def _route_after_verify(
     if final_report is None:
         if state.get("verify_retry_count", 0) < 2:
             return "generate_report_node"
-        # 超过最大重试次数时使用兜底合法草稿构建报告
         clues = state.get("extracted_clues", {})
         ev_pool = _dedup_evidences(state.get("evidence", []))
-        fallback_draft = _build_grounded_report_draft(clues, state.get("hypotheses", []), ev_pool)
-        rep, _ = verify_and_finalize_report(state.get("incident_id", "inc_default"), fallback_draft, ev_pool)
+        fallback_draft = _build_grounded_report_draft(
+            clues, state.get("hypotheses", []), ev_pool
+        )
+        rep, _ = verify_and_finalize_report(
+            state.get("incident_id", "inc_default"), fallback_draft, ev_pool
+        )
         if rep and rep.need_code_patch:
             return "patch_subgraph_node"
         return "human_approval_node"
@@ -516,25 +556,25 @@ def _route_after_verify(
 
 
 # ============================================================================
-# 节点 8: patch_subgraph_node (调用子图三：沙箱代码修复与 pytest 自愈闭环)
+# 节点 8: patch_subgraph_node (调用子图三：沙箱代码修复与 pytest 自愈闭环，透传 runtime.context)
 # ============================================================================
-def patch_subgraph_node(state: IncidentMainState) -> dict:
+async def patch_subgraph_node(
+    state: IncidentMainState, runtime: Runtime[IncidentGraphContext]
+) -> dict:
     report = state["final_report"]
     ev_pool = _dedup_evidences(state.get("evidence", []))
     inc_id = state.get("incident_id", "inc_default")
 
-    patch_res = patch_subgraph.invoke(
-        {
-            "incident_id": inc_id,
-            "report": report,
-            "evidence": ev_pool,
-            "sandbox_dir": "",
-            "target_files": [],
-            "patch_diff": "",
-            "pytest_output": "",
-            "test_passed": False,
-            "retry_count": 0,
-        }
+    patch_res = await patch_subgraph.ainvoke(
+        PatchSelfHealSubState(
+            incident_id=inc_id,
+            report=report,
+            evidence=ev_pool,
+            test_passed=False,
+            retry_count=0,
+            human_feedback=state.get("human_feedback", ""),
+        ),
+        context=runtime.context,
     )
     return {
         "patch_diff": patch_res.get("patch_diff", ""),
@@ -545,7 +585,9 @@ def patch_subgraph_node(state: IncidentMainState) -> dict:
 # ============================================================================
 # 节点 9: human_approval_node (基于 LangGraph interrupt() 的人工审批挂起节点)
 # ============================================================================
-def human_approval_node(state: IncidentMainState) -> dict:
+async def human_approval_node(
+    state: IncidentMainState, runtime: Runtime[IncidentGraphContext]
+) -> dict:
     report = state.get("final_report")
     patch_diff = state.get("patch_diff", "")
     test_passed = state.get("test_passed", False)
@@ -561,7 +603,6 @@ def human_approval_node(state: IncidentMainState) -> dict:
         "message": "排障报告与沙箱验证已就绪，请人工审批是否合并补丁并结案归档。",
     }
 
-    # 触发 LangGraph 原生断点挂起，等待前端调用 /approval 接口通过 Command(resume=...) 唤醒
     resume_value = interrupt(interrupt_payload)
 
     if isinstance(resume_value, dict):
@@ -588,40 +629,72 @@ def _route_after_approval(
 
 
 # ============================================================================
-# 节点 10: apply_and_evolve_node (故障经验自进化归档：写入历史故障知识库)
+# 节点 10: apply_and_evolve_node (通过 runtime.context 中的仓储写入 MySQL -> ES -> Qdrant)
 # ============================================================================
-def apply_and_evolve_node(state: IncidentMainState) -> dict:
+async def apply_and_evolve_node(
+    state: IncidentMainState, runtime: Runtime[IncidentGraphContext]
+) -> dict:
+    ctx = runtime.context
     report = state.get("final_report")
     clues = state.get("extracted_clues", {})
     inc_id = state.get("incident_id", "inc_default")
+    approval = state.get("human_approval", "approved")
+
+    if approval == "rejected":
+        reject_msg = AIMessage(
+            content=f"本次排障会话 (`{inc_id}`) 的处置建议已被人工驳回，未写入历史故障知识库。"
+        )
+        return {"messages": [reject_msg]}
 
     if report is not None:
         new_code = f"INC-AUTO-{inc_id[-4:].upper()}"
-        storage_manager.add_runbook_memory(
-            {
-                "incident_code": new_code,
-                "title": clues.get("title", report.summary[:40]),
-                "symptoms": report.problem,
-                "root_cause": report.cause,
-                "resolution": "\n".join(report.next_steps),
-                "service_name": f"{clues.get('module_hint', 'core')}-service",
-                "error_keywords": f"{clues.get('error_keyword', '')} {clues.get('api_path', '')}".strip(),
-            }
+        # 1. 先存 MySQL 关系库 historical_runbooks 主表 (Source of Truth)
+        rb_model = await ctx["runbook_repo"].create_if_not_exists(
+            incident_code=new_code,
+            title=clues.get("title", report.summary[:40]),
+            symptoms=report.problem,
+            root_cause=report.cause,
+            resolution="\n".join(report.next_steps),
+            service_name=f"{clues.get('module_hint', 'core')}-service",
+            error_keywords=f"{clues.get('error_keyword', '')} {clues.get('api_path', '')}".strip(),
         )
+        runbook_doc = {
+            "incident_code": rb_model.incident_code,
+            "title": rb_model.title,
+            "symptoms": rb_model.symptoms,
+            "root_cause": rb_model.root_cause,
+            "resolution": rb_model.resolution,
+            "service_name": rb_model.service_name,
+            "error_keywords": rb_model.error_keywords,
+        }
+        # 2. 同步写入 ES BM25 索引
+        await ctx["runbook_es_repo"].index_runbook(runbook_doc)
+        # 3. 同步向量化并写入 Qdrant 向量集合
+        embed_text = (
+            f"故障标题: {runbook_doc['title']}\n"
+            f"故障现象: {runbook_doc['symptoms']}\n"
+            f"故障根因: {runbook_doc['root_cause']}\n"
+            f"解决方案: {runbook_doc['resolution']}"
+        )
+        vector = await ctx["embedding"].aembed_query(embed_text)
+        await ctx["runbook_qdrant_repo"].upsert_runbook(vector=vector, payload=runbook_doc)
 
     summary_msg = AIMessage(
         content=(
             f"本次排障会话 (`{inc_id}`) 已完成人工审批并结案归档。\n"
             f"- 报告 SHA-256 指纹: `{report.digest if report else ''}`\n"
-            f"- 经验自进化状态: 已将本次根因与解决方案同步写入历史故障知识库。"
+            f"- 经验自进化状态: 已将本次根因与解决方案同步写入 MySQL、ES 与 Qdrant 历史故障知识库。"
         )
     )
     return {"messages": [summary_msg]}
 
 
 def build_main_incident_graph(checkpointer=None):
-    """构建并编译包含 3 大子图与 Checkpointer 状态持久化的排障主图"""
-    builder = StateGraph(IncidentMainState)
+    """构建并编译包含 IncidentGraphContext 运行期依赖注入上下文与 Checkpointer 的排障主图"""
+    builder = StateGraph(
+        state_schema=IncidentMainState,
+        context_schema=IncidentGraphContext,
+    )
 
     builder.add_node("triage_node", triage_node)
     builder.add_node("crag_subgraph_node", crag_subgraph_node)
@@ -638,13 +711,11 @@ def build_main_incident_graph(checkpointer=None):
     builder.add_edge("triage_node", "crag_subgraph_node")
     builder.add_edge("crag_subgraph_node", "hypothesis_planner_node")
 
-    # 通过 Send API 动态扇出并行探针子图实例
     builder.add_conditional_edges(
         "hypothesis_planner_node",
         _dispatch_probe_workers,
         ["probe_worker_node"],
     )
-    # 所有并行探针执行完毕后自动汇聚至 evidence_evaluate_node
     builder.add_edge("probe_worker_node", "evidence_evaluate_node")
 
     builder.add_conditional_edges(

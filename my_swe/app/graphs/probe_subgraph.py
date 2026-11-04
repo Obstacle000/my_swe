@@ -1,18 +1,18 @@
 """子图二：单假设探针验证子图 (ProbeWorkerSubgraph)
-由主图通过 LangGraph Send API 并行派生多个 Worker 实例。
-核心工程机制：
-1. 工具物理隔离：根据 hypothesis.probe_type ('log' / 'code' / 'db') 仅绑定专属工具集。
-2. 上下文隔离与预算锁：中间 ToolMessage 仅保存在私有 worker_messages 中，且受 remaining_chars (15000) 预算控制。
-3. 不可伪造证据签发：probe_tool_node 拦截工具返回结果，自动执行 redact_text() 脱敏并签发 Evidence 合并回主图。
+通过 Runtime[IncidentGraphContext] 从运行上下文中获取注入的：
+- runtime_log_es_repo (ES 运行态日志仓储)
+- mall_probe_repo (MySQL 电商靶场只读探针仓储)
 """
 
 import json
 from typing import Literal
 from langchain_core.messages import AIMessage, SystemMessage, ToolMessage
 from langgraph.graph import END, START, StateGraph
+from langgraph.runtime import Runtime
 
 from app.config import get_llm, settings
 from app.core.evidence_collector import build_evidence
+from app.graphs.context import IncidentGraphContext
 from app.graphs.state import ProbeWorkerState
 from app.prompts.loader import load_prompt
 from app.schemas.incident_schemas import Evidence
@@ -26,9 +26,7 @@ _TOOLSET_BY_PROBE_TYPE = {
     "db": DB_TOOLS,
 }
 
-_ALL_PROBE_TOOLS_BY_NAME = {
-    t.name: t for t in (LOG_TOOLS + CODE_TOOLS + DB_TOOLS)
-}
+_CODE_TOOLS_BY_NAME = {t.name: t for t in CODE_TOOLS}
 
 
 def _has_valid_llm_key() -> bool:
@@ -36,14 +34,15 @@ def _has_valid_llm_key() -> bool:
     return bool(key) and not key.startswith("sk-your-") and key != "sk-placeholder"
 
 
-def probe_agent_node(state: ProbeWorkerState) -> dict:
+async def probe_agent_node(
+    state: ProbeWorkerState, runtime: Runtime[IncidentGraphContext]
+) -> dict:
     """探针推理节点：根据假设类型挂载隔离工具集并决定调用哪个探针工具"""
     hypothesis = state["hypothesis"]
     clues = state.get("clues", {})
     remaining = state.get("remaining_chars", 15000)
     worker_msgs = list(state.get("worker_messages", []))
 
-    # 若预算已耗尽或已执行过 2 轮工具调用，直接结束当前探针
     tool_msg_count = sum(1 for m in worker_msgs if isinstance(m, ToolMessage))
     if remaining <= 0 or tool_msg_count >= 2:
         return {"worker_messages": [AIMessage(content="探针取证已完成。")]}
@@ -62,14 +61,15 @@ def probe_agent_node(state: ProbeWorkerState) -> dict:
         try:
             llm_with_tools = get_llm(temperature=0.0).bind_tools(tools)
             invoke_msgs = [SystemMessage(content=sys_prompt)] + worker_msgs
-            ai_resp = llm_with_tools.invoke(invoke_msgs)
+            ai_resp = await llm_with_tools.ainvoke(invoke_msgs)
             return {"worker_messages": [ai_resp]}
         except Exception:
             pass
 
-    # 若未配置在线 LLM Key 或处于离线演示环境，基于假设与线索生成真实的工具调用指令
     if tool_msg_count == 0:
-        fallback_calls = _build_deterministic_tool_calls(hypothesis.probe_type, clues, hypothesis.title)
+        fallback_calls = _build_deterministic_tool_calls(
+            hypothesis.probe_type, clues, hypothesis.title
+        )
         return {
             "worker_messages": [
                 AIMessage(
@@ -82,7 +82,9 @@ def probe_agent_node(state: ProbeWorkerState) -> dict:
     return {"worker_messages": [AIMessage(content="探针取证完毕。")]}
 
 
-def _build_deterministic_tool_calls(probe_type: str, clues: dict[str, str], title: str) -> list[dict]:
+def _build_deterministic_tool_calls(
+    probe_type: str, clues: dict[str, str], title: str
+) -> list[dict]:
     """根据排障线索与探针类型构造真实的工具调用请求"""
     uid = clues.get("user_id", "")
     api_path = clues.get("api_path", "")
@@ -187,8 +189,57 @@ def _build_deterministic_tool_calls(probe_type: str, clues: dict[str, str], titl
     ]
 
 
-def probe_tool_node(state: ProbeWorkerState) -> dict:
-    """工具执行与自动证据签发包装节点 (Evidence Signing Wrapper)"""
+async def _execute_tool_with_context(
+    t_name: str,
+    t_args: dict,
+    ctx: IncidentGraphContext,
+) -> str:
+    """使用 runtime.context 中注入的 Repository 实例执行对应的探针查询"""
+    log_es_repo = ctx["runtime_log_es_repo"]
+    mall_probe_repo = ctx["mall_probe_repo"]
+
+    if t_name == "search_error_logs":
+        hits = await log_es_repo.search_logs(
+            keyword=t_args.get("keyword", ""),
+            api_path=t_args.get("api_path", ""),
+            user_id=str(t_args.get("user_id", "")),
+            level=t_args.get("level", ""),
+            limit=5,
+        )
+        if not hits:
+            return "未检索到匹配的运行态日志，请尝试放宽过滤条件。"
+        return json.dumps(hits, ensure_ascii=False, indent=2)
+
+    if t_name == "get_trace_logs":
+        logs = await log_es_repo.get_logs_by_trace_id(str(t_args.get("trace_id", "")))
+        if not logs:
+            return f"未找到 trace_id={t_args.get('trace_id')} 对应的链路日志。"
+        return json.dumps(logs, ensure_ascii=False, indent=2)
+
+    if t_name == "inspect_table_schema":
+        return mall_probe_repo.get_table_ddl(t_args.get("table_name", "all"))
+
+    if t_name == "execute_readonly_sql":
+        sql_query = str(t_args.get("sql_query", ""))
+        ok, result = await mall_probe_repo.execute_readonly_select(sql_query)
+        if not ok:
+            return str(result)
+        if not result:
+            return f"查询成功，但返回 0 行记录 (SQL: {sql_query})。"
+        return json.dumps(result, ensure_ascii=False, indent=2)
+
+    code_tool = _CODE_TOOLS_BY_NAME.get(t_name)
+    if code_tool is not None:
+        return str(code_tool.invoke(t_args))
+
+    return f"未找到工具: {t_name}"
+
+
+async def probe_tool_node(
+    state: ProbeWorkerState, runtime: Runtime[IncidentGraphContext]
+) -> dict:
+    """工具执行与自动证据签发包装节点：通过 runtime.context 中的仓储访问 ES 与 MySQL"""
+    ctx = runtime.context
     worker_msgs = state.get("worker_messages", [])
     remaining = state.get("remaining_chars", 15000)
     if not worker_msgs:
@@ -217,16 +268,11 @@ def probe_tool_node(state: ProbeWorkerState) -> dict:
             )
             continue
 
-        tool_fn = _ALL_PROBE_TOOLS_BY_NAME.get(t_name)
-        if tool_fn is None:
-            raw_out = f"未找到工具: {t_name}"
-        else:
-            try:
-                raw_out = str(tool_fn.invoke(t_args))
-            except Exception as exc:
-                raw_out = f"工具调用异常 ({t_name}): {exc}"
+        try:
+            raw_out = await _execute_tool_with_context(t_name, t_args, ctx)
+        except Exception as exc:
+            raw_out = f"工具调用异常 ({t_name}): {exc}"
 
-        # 自动脱敏并签发不可伪造的 Evidence 对象
         ev = build_evidence(tool_name=t_name, tool_args=t_args, raw_output=raw_out)
         signed_evidences.append(ev)
         remaining = max(0, remaining - len(ev.raw_snippet))
@@ -259,8 +305,8 @@ def _route_probe_worker(
 
 
 def build_probe_subgraph():
-    """构建并编译单假设探针验证子图"""
-    builder = StateGraph(ProbeWorkerState)
+    """构建并编译带 IncidentGraphContext 上下文 Schema 的单假设探针验证子图"""
+    builder = StateGraph(state_schema=ProbeWorkerState, context_schema=IncidentGraphContext)
     builder.add_node("probe_agent_node", probe_agent_node)
     builder.add_node("probe_tool_node", probe_tool_node)
 

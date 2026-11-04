@@ -1,23 +1,16 @@
-"""FastAPI 后端主入口 (对应《5_API _DOC.md》)"""
+"""FastAPI 后端主入口 (参考 my_nl2sql/main.py)"""
 
-from contextlib import asynccontextmanager
+from pathlib import Path
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 
 from app.api.incidents_router import router as incidents_router
 from app.api.knowledge_router import router as knowledge_router
+from app.api.lifespan import lifespan
 from app.api.range_router import router as range_router
-from app.core.storage_backends import seed_databases_if_empty
 from app.schemas.api_schemas import ApiResponse
 from target_mall_app.app.api.order_router import router as target_mall_order_router
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """应用启动生命周期：自动初始化并预置平台库与被排查电商靶场库"""
-    await seed_databases_if_empty()
-    yield
-
 
 app = FastAPI(
     title="基于 LangGraph 的企业级多源故障根因定位与代码自愈系统 (My-SWE)",
@@ -44,6 +37,13 @@ app.include_router(knowledge_router)
 
 # 挂载内置被排查电商靶场路由（可直接访问触发真实异常）
 app.include_router(target_mall_order_router, prefix="/target-mall")
+
+
+@app.get("/", include_in_schema=False)
+async def serve_demo_console() -> FileResponse:
+    """提供内置的 SSE 流式排障与打字机输出演示控制台页面"""
+    html_file = Path(__file__).resolve().parent / "static" / "index.html"
+    return FileResponse(html_file)
 
 
 @app.get("/health", response_model=ApiResponse, tags=["0. 健康检查"])

@@ -32,10 +32,12 @@ my_swe/
 │   ├── prompts/                     # Markdown + Jinja2 提示词模板与加载器
 │   ├── schemas/                     # Pydantic v2 业务契约与 API 请求/响应 Schema
 │   ├── models/                      # SQLAlchemy 2.0 异步 ORM 模型
+│   ├── repositories/                # 数据访问仓储层 (IncidentRepository / RunbookRepository / MallProbeRepository)
 │   ├── core/                        # 证据采集脱敏、防幻觉报告校验器、RRF 双路混合检索后端
 │   ├── tools/                       # 四大隔离工具集 (LOG_TOOLS / CODE_TOOLS / DB_TOOLS / SANDBOX_TOOLS)
 │   ├── graphs/                      # LangGraph 主图 (main_graph.py) 与三大子图实现
-│   └── api/                         # FastAPI 路由层 (靶场注入、排障 SSE 流、HITL 审批、RRF 调试)
+│   ├── services/                    # 业务服务层 (IncidentService / RangeService / KnowledgeService)
+│   └── api/                         # 轻量 FastAPI 路由控制层 (仅做参数校验与调用 Service)
 └── tests/
     └── test_platform_workflow.py    # 排障平台自动化单元测试
 ```
