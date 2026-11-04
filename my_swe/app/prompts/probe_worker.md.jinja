@@ -4,6 +4,14 @@
 
 ### 背景线索：
 {{ clues_summary }}
+{% if known_facts and known_facts|length > 0 %}
+
+### 前序探针已查明的现场确凿事实清单（Known Facts）：
+{% for fact in known_facts %}
+- {{ fact }}
+{% endfor %}
+请结合上述已知事实（例如已定位的报错文件与行号、异常堆栈或数据库业务记录），直奔靶心高效取证！
+{% endif %}
 
 ### 执行纪律：
 1. 请直接使用你身上绑定的工具针对上述任务进行取证（最多调用 2 ~ 3 次工具即可，查清事实后立即停止调用工具并给出简短总结）。

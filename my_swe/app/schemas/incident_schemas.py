@@ -14,11 +14,28 @@ class TriageClues(BaseModel):
     title: str = Field(default="故障排查会话", description="15字以内的排障会话简短标题")
 
 
+EvidenceSource = Literal[
+    "error_log",     # 运行态报错堆栈与异常日志 (search_error_logs)
+    "trace_log",     # 全链路追踪调用链上下文日志 (get_trace_logs)
+    "source_code",   # 本地源码与配置文件只读切片 (read_file_window)
+    "code_search",   # 源码全局符号搜索与目录探查结果 (grep_code, ls_directory)
+    "git_history",   # Git Blame、提交历史与版本变更 Diff (git_blame_diff)
+    "db_schema",     # 数据库表结构 DDL 与字段元数据 (inspect_table_schema)
+    "db_record",     # 数据库业务表只读行级查询记录 (execute_readonly_sql)
+    "crag_runbook",  # CRAG 历史排障手册与相似案例检索 (crag_runbook_search)
+    # 兼容历史别名
+    "es_log",
+    "codebase",
+    "mysql_db",
+    "runbook",
+]
+
+
 class Evidence(BaseModel):
     """由工具包装器自动签发的真实证据记录 (大模型不可篡改或伪造)"""
 
     id: str = Field(..., description="唯一证据编号，如 ev_log:a1b2, ev_code:c3d4, ev_db:e5f6")
-    source: Literal["es_log", "codebase", "mysql_db", "git_history", "runbook"]
+    source: EvidenceSource = Field(..., description="精准细致的证据来源类型")
     tool_name: str = Field(..., description="产生该证据的工具名称")
     query_args: str = Field(..., description="调用工具时的参数 JSON 字符串")
     summary: str = Field(..., max_length=500, description="证据简述")
@@ -57,6 +74,30 @@ class HypothesisPlanList(BaseModel):
 
     hypotheses: list[Hypothesis] = Field(
         ..., max_length=3, description="每次生成的 1~3 个并行待验证排障假设"
+    )
+
+
+class EvidenceEvaluation(BaseModel):
+    """证据评估节点 (evidence_evaluate_node) 的大模型结构化输出"""
+
+    is_sufficient: bool = Field(
+        ...,
+        description="现有真实证据池是否已足以锁定确凿根因（若关键报错堆栈、源码缺陷行或数据库脏数据已形成闭环则为 True，否则为 False）",
+    )
+    reason: str = Field(
+        default="",
+        max_length=500,
+        description="判定证据充足或不足的核心依据简述",
+    )
+    updated_hypotheses: list[Hypothesis] = Field(
+        default_factory=list,
+        max_length=6,
+        description="根据当前已收集证据，更新验证状态 (supported/plausible/rejected) 并绑定真实 evidence_ids 后的假设列表",
+    )
+    missing_clues: list[str] = Field(
+        default_factory=list,
+        max_length=5,
+        description="若证据不足以锁定根因，指出还差哪些具体线索（如缺失某文件源码、某表字段记录或某接口报错日志），将写入 gaps 供下一轮重规划使用",
     )
 
 

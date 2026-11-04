@@ -115,7 +115,15 @@ def test_evidence_redaction_and_id_signing():
 
     ev = build_evidence("search_error_logs", {"user_id": "10086"}, raw_log)
     assert ev.id.startswith("ev_log:")
-    assert ev.source == "es_log"
+    assert ev.source == "error_log"
+
+    ev_code = build_evidence("read_file_window", {"file_path": "a.py"}, "code content")
+    assert ev_code.source == "source_code"
+    assert ev_code.id.startswith("ev_code:")
+
+    ev_db = build_evidence("execute_readonly_sql", {"sql_query": "SELECT 1"}, "result")
+    assert ev_db.source == "db_record"
+    assert ev_db.id.startswith("ev_db:")
 
 
 def test_anti_hallucination_verifier_rejects_fake_evidence_id():
@@ -303,4 +311,88 @@ def test_fastapi_routers_with_annotated_deps_and_service_injection():
         assert r_approve.json()["data"]["new_status"] == "resolved"
 
     asyncio.run(engine.dispose())
+
+
+def test_evidence_evaluate_node_and_routing():
+    from app.graphs.main_graph import evidence_evaluate_node, _route_after_evaluate
+    from app.graphs.state import IncidentMainState
+
+    async def _test():
+        # 1. 模拟空证据池
+        state_empty: IncidentMainState = {
+            "incident_id": "inc_empty",
+            "workspace_id": "ws_test",
+            "messages": [],
+            "evidence": [],
+            "loop_count": 0,
+            "verify_retry_count": 0,
+            "test_passed": False,
+            "human_approval": "pending",
+        }
+        res_empty = await evidence_evaluate_node(state_empty, runtime=None)
+        assert res_empty["evidence_sufficient"] is False
+        assert "evaluate_retry_reason" in res_empty
+        assert len(res_empty["evaluate_retry_reason"]) > 0
+        state_empty.update(res_empty)
+        # 证据不足且 loop_count < 2 时，路由打回重新规划
+        assert _route_after_evaluate(state_empty) == "hypothesis_planner_node"
+
+        # 若达到循环上限 (loop_count >= 2)，即便证据不足也推进到生成报告
+        state_empty["loop_count"] = 2
+        assert _route_after_evaluate(state_empty) == "generate_report_node"
+
+        # 2. 模拟包含有效证据
+        real_ev = build_evidence(
+            "read_file_window", {"file_path": "order_service.py"}, "line 64: TypeError"
+        )
+        state_with_ev: IncidentMainState = {
+            "incident_id": "inc_with_ev",
+            "workspace_id": "ws_test",
+            "messages": [],
+            "evidence": [real_ev],
+            "loop_count": 0,
+            "verify_retry_count": 0,
+            "test_passed": False,
+            "human_approval": "pending",
+        }
+        res_with_ev = await evidence_evaluate_node(state_with_ev, runtime=None)
+        assert res_with_ev["evidence_sufficient"] is True
+        assert res_with_ev["evaluate_retry_reason"] == ""
+        state_with_ev.update(res_with_ev)
+        assert _route_after_evaluate(state_with_ev) == "generate_report_node"
+
+    asyncio.run(_test())
+
+
+def test_dispatch_probe_workers_carries_known_facts():
+    from app.graphs.main_graph import _dispatch_probe_workers
+    from app.graphs.state import IncidentMainState
+    from app.schemas.incident_schemas import Hypothesis
+
+    ev1 = build_evidence(
+        "search_error_logs",
+        {"api_path": "/api/orders/checkout"},
+        "TypeError at order_service.py:64",
+        summary_override="已定位到接口报错发生在 order_service.py 第 64 行",
+    )
+    h1 = Hypothesis(id="h1", title="检查 order_service.py 源码", probe_type="code")
+    state: IncidentMainState = {
+        "incident_id": "inc_fact_test",
+        "workspace_id": "ws_test",
+        "messages": [],
+        "evidence": [ev1],
+        "hypotheses": [h1],
+        "loop_count": 1,
+        "verify_retry_count": 0,
+        "test_passed": False,
+        "human_approval": "pending",
+    }
+    sends = _dispatch_probe_workers(state)
+    assert len(sends) == 1
+    worker_state = sends[0].arg
+    assert "known_facts" in worker_state
+    assert len(worker_state["known_facts"]) == 1
+    assert "order_service.py 第 64 行" in worker_state["known_facts"][0]
+
+
 

@@ -187,9 +187,9 @@ CREATE TABLE `patch_records` (
 
 ---
 
-#### 表 6：`knowledge_runbooks`（历史故障复盘知识库主表）
+#### 表 6：`historical_runbooks`（历史故障复盘知识库主表）
 ```sql
-CREATE TABLE `knowledge_runbooks` (
+CREATE TABLE `historical_runbooks` (
     `case_id` VARCHAR(64) NOT NULL COMMENT '历史故障案例编号 (如 INC-2026-089)，与 ES 和 Qdrant 中的主键严格一致',
     `title` VARCHAR(255) NOT NULL COMMENT '故障案例标题',
     `error_signature` VARCHAR(255) NULL COMMENT '特征异常类名或报错码，如 TypeError, ConnectTimeoutError',

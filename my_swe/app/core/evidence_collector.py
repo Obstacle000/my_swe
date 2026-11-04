@@ -6,7 +6,7 @@ import re
 from typing import Literal
 
 from app.config import now_iso
-from app.schemas.incident_schemas import Evidence
+from app.schemas.incident_schemas import Evidence, EvidenceSource
 
 # 敏感信息脱敏正则规则集
 _SECRET_PATTERNS = [
@@ -15,17 +15,17 @@ _SECRET_PATTERNS = [
     (re.compile(r"\bsk-[A-Za-z0-9]{12,}\b"), "sk-***REDACTED***"),
 ]
 
-# 工具名到证据来源与前缀的映射表
-_TOOL_SOURCE_MAP: dict[str, tuple[Literal["es_log", "codebase", "mysql_db", "git_history", "runbook"], str]] = {
-    "search_error_logs": ("es_log", "ev_log"),
-    "get_trace_logs": ("es_log", "ev_log"),
-    "ls_directory": ("codebase", "ev_code"),
-    "grep_code": ("codebase", "ev_code"),
-    "read_file_window": ("codebase", "ev_code"),
+# 工具名到精细化证据来源与 ID 前缀的映射表
+_TOOL_SOURCE_MAP: dict[str, tuple[EvidenceSource, str]] = {
+    "search_error_logs": ("error_log", "ev_log"),
+    "get_trace_logs": ("trace_log", "ev_log"),
+    "ls_directory": ("code_search", "ev_code"),
+    "grep_code": ("code_search", "ev_code"),
+    "read_file_window": ("source_code", "ev_code"),
     "git_blame_diff": ("git_history", "ev_git"),
-    "inspect_table_schema": ("mysql_db", "ev_db"),
-    "execute_readonly_sql": ("mysql_db", "ev_db"),
-    "crag_runbook_search": ("runbook", "ev_hist"),
+    "inspect_table_schema": ("db_schema", "ev_db"),
+    "execute_readonly_sql": ("db_record", "ev_db"),
+    "crag_runbook_search": ("crag_runbook", "ev_hist"),
 }
 
 

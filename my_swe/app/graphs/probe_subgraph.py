@@ -33,7 +33,10 @@ def _has_valid_llm_key() -> bool:
     key = (settings.llm_api_key or "").strip()
     return bool(key) and not key.startswith("sk-your-") and key != "sk-placeholder"
 
-
+# 最初的一版有缺陷,探针不能依靠重试机制,把前面几轮探针得出的结论有效利用起来,
+# 必须在Send的时候传入以得出的事实,以及生成假设时,根据以得出前序探针事实和检索证据进行生成
+# 模型理解并排错是一个循环的过程 提出假设->探针排查->得出证据->证据不足->提出新假设->带着以得出结论探针排查->...
+# 这个过程中,三个探针会把局部结论更新到全局evidence,让三个探针互相知道对方得出的证据
 async def probe_agent_node(
     state: ProbeWorkerState, runtime: Runtime[IncidentGraphContext]
 ) -> dict:
@@ -47,6 +50,8 @@ async def probe_agent_node(
     if remaining <= 0 or tool_msg_count >= 2:
         return {"worker_messages": [AIMessage(content="探针取证已完成。")]}
 
+    known_facts = list(state.get("known_facts", []))
+
     tools = _TOOLSET_BY_PROBE_TYPE.get(hypothesis.probe_type, CODE_TOOLS)
     sys_prompt = load_prompt(
         "probe_worker.md.jinja",
@@ -55,6 +60,7 @@ async def probe_agent_node(
         hypothesis_title=hypothesis.title,
         clues_text=json.dumps(clues, ensure_ascii=False),
         remaining_chars=remaining,
+        known_facts=known_facts,
     )
 
     if _has_valid_llm_key():
@@ -81,7 +87,7 @@ async def probe_agent_node(
 
     return {"worker_messages": [AIMessage(content="探针取证完毕。")]}
 
-
+# 兜底工具调用
 def _build_deterministic_tool_calls(
     probe_type: str, clues: dict[str, str], title: str
 ) -> list[dict]:
@@ -197,7 +203,7 @@ async def _execute_tool_with_context(
     """使用 runtime.context 中注入的 Repository 实例执行对应的探针查询"""
     log_es_repo = ctx["runtime_log_es_repo"]
     mall_probe_repo = ctx["mall_probe_repo"]
-
+    # 有的工具需要额外的参数,模型不知道只能手动传入
     if t_name == "search_error_logs":
         hits = await log_es_repo.search_logs(
             keyword=t_args.get("keyword", ""),
@@ -252,6 +258,7 @@ async def probe_tool_node(
 
     tool_messages: list[ToolMessage] = []
     signed_evidences: list[Evidence] = []
+    recorded_gaps: list[str] = []
 
     for tc in tool_calls:
         t_name = tc["name"]
@@ -259,11 +266,13 @@ async def probe_tool_node(
         t_id = tc.get("id", f"call_{t_name}")
 
         if remaining <= 0:
+            gap_msg = f"[探针 {state['hypothesis'].id} 预算熔断] 字符采集预算 (15,000 chars) 已耗尽，跳过工具 {t_name}。"
+            recorded_gaps.append(gap_msg)
             tool_messages.append(
                 ToolMessage(
                     tool_call_id=t_id,
                     name=t_name,
-                    content="[预算熔断] 当前探针字符采集预算 (15,000 chars) 已耗尽，停止采集。",
+                    content=gap_msg,
                 )
             )
             continue
@@ -272,6 +281,7 @@ async def probe_tool_node(
             raw_out = await _execute_tool_with_context(t_name, t_args, ctx)
         except Exception as exc:
             raw_out = f"工具调用异常 ({t_name}): {exc}"
+            recorded_gaps.append(f"[探针 {state['hypothesis'].id} 工具异常] {raw_out}")
 
         ev = build_evidence(tool_name=t_name, tool_args=t_args, raw_output=raw_out)
         signed_evidences.append(ev)
@@ -288,6 +298,7 @@ async def probe_tool_node(
     return {
         "worker_messages": tool_messages,
         "evidence": signed_evidences,
+        "gaps": recorded_gaps,
         "remaining_chars": remaining,
     }
 
@@ -309,7 +320,7 @@ def build_probe_subgraph():
     builder = StateGraph(state_schema=ProbeWorkerState, context_schema=IncidentGraphContext)
     builder.add_node("probe_agent_node", probe_agent_node)
     builder.add_node("probe_tool_node", probe_tool_node)
-
+    # 连线是简单的ReAct
     builder.add_edge(START, "probe_agent_node")
     builder.add_conditional_edges(
         "probe_agent_node",

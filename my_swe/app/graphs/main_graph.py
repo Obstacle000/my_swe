@@ -28,6 +28,7 @@ from app.prompts.loader import load_prompt
 from app.schemas.incident_schemas import (
     Claim,
     Evidence,
+    EvidenceEvaluation,
     Hypothesis,
     HypothesisPlanList,
     ReportDraft,
@@ -41,6 +42,8 @@ def _has_valid_llm_key() -> bool:
 
 
 def _latest_user_query(state: IncidentMainState) -> str:
+    if state.get("user_query"):
+        return str(state["user_query"])
     for msg in reversed(state.get("messages", [])):
         if isinstance(msg, HumanMessage) or getattr(msg, "type", "") == "human":
             return str(msg.content)
@@ -69,7 +72,7 @@ async def triage_node(
             }
         except Exception:
             pass
-
+    # 兜底逻辑
     uid_match = re.search(r"\b(1008[6-9]|\d{4,8})\b", user_text)
     api_match = re.search(r"(/api/[a-zA-Z0-9_\-/]+)", user_text)
     user_id = uid_match.group(1) if uid_match else ""
@@ -145,23 +148,46 @@ async def hypothesis_planner_node(
     hist_ctx = state.get("historical_context", "")
     crag_hit = state.get("crag_hit", False)
     loop_count = state.get("loop_count", 0)
+    retry_reason = state.get("evaluate_retry_reason", "")
+    ev_pool = _dedup_evidences(state.get("evidence", []))
 
     if _has_valid_llm_key():
         try:
             sys_prompt = load_prompt("planner.md")
+            # crag_hit 为false 那么historical_context一定不存在,true一定存在,可能是兜底发力了
             user_ctx = (
                 f"【分诊提取线索】：{json.dumps(clues, ensure_ascii=False)}\n"
                 f"【CRAG 历史故障检索结果 (crag_hit={crag_hit})】：\n{hist_ctx}\n"
             )
+            # 注入前序所有探针已查明的确凿证据事实账本 (Evidence Ledger)
+            if ev_pool:
+                facts_text = "\n".join(
+                    f"- 证据[{ev.source}] 来自工具 {ev.tool_name} (ID: `{ev.id}`):\n"
+                    f"  结论摘要: {ev.summary}\n"
+                    f"  内容切片: {ev.raw_snippet[:300]}"
+                    for ev in ev_pool
+                )
+                user_ctx += f"\n【前序探针已查明的现场确凿事实清单 (Evidence Ledger)】：\n{facts_text}\n"
+
+            if retry_reason:
+                user_ctx += (
+                    f"\n【上一轮证据审查打回原因 (evaluate_retry_reason)】：\n"
+                    f"{retry_reason}\n"
+                    f"请务必重点针对上述审查意见与待补线索，结合前序已查明的事实清单，有针对性地生成新一轮排障假设以补全证据链！\n"
+                )
             planner_llm = get_llm(temperature=0.0).with_structured_output(HypothesisPlanList)
             plan: HypothesisPlanList = await planner_llm.ainvoke(
                 [SystemMessage(content=sys_prompt), HumanMessage(content=user_ctx)]
             )
             if plan.hypotheses:
-                return {"hypotheses": plan.hypotheses, "loop_count": loop_count + 1}
+                return {
+                    "hypotheses": plan.hypotheses,
+                    "loop_count": loop_count + 1,
+                    "evaluate_retry_reason": "",
+                }
         except Exception:
             pass
-
+    # 全量兜底探针搜索
     mod_hint = clues.get("module_hint", "order")
     if crag_hit or mod_hint == "sms":
         hypotheses = [
@@ -221,15 +247,23 @@ async def hypothesis_planner_node(
 # ============================================================================
 def _dispatch_probe_workers(state: IncidentMainState) -> list[Send]:
     clues = state.get("extracted_clues", {})
+    ev_pool = _dedup_evidences(state.get("evidence", []))
+    # 提炼出已知的情报事实摘要下发给并行探针 (Known Facts)
+    known_facts = [
+        f"[{e.source}:{e.tool_name}] {e.summary}"
+        for e in ev_pool
+    ]
     return [
         Send(
             "probe_worker_node",
             ProbeWorkerState(
                 hypothesis=h,
                 clues=clues,
+                known_facts=known_facts,
                 worker_messages=[],
                 remaining_chars=15000,
                 evidence=[],
+                gaps=[],
             ),
         )
         for h in state.get("hypotheses", [])
@@ -242,24 +276,93 @@ def _dispatch_probe_workers(state: IncidentMainState) -> list[Send]:
 async def probe_worker_node(
     state: ProbeWorkerState, runtime: Runtime[IncidentGraphContext]
 ) -> dict:
+    # 调用三次探针子图,每一次state的Hypothesis不同
     sub_res = await probe_subgraph.ainvoke(state, context=runtime.context)
-    return {"evidence": sub_res.get("evidence", [])}
+    return {
+        "evidence": sub_res.get("evidence", []),
+        "gaps": sub_res.get("gaps", []),
+    }
 
 
 # ============================================================================
-# 节点 5: evidence_evaluate_node (评估并行探针归并后的证据池充分性)
+# 节点 5: evidence_evaluate_node (评估并行探针归并后的证据池充分性与生成打回批注)
 # ============================================================================
 async def evidence_evaluate_node(
     state: IncidentMainState, runtime: Runtime[IncidentGraphContext]
 ) -> dict:
-    return {"evidence": []}
+    """审查并行探针汇总的真实证据池，判定是否足以锁定确凿根因；若不足则生成 evaluate_retry_reason"""
+    ev_list = _dedup_evidences(state.get("evidence", []))
+    clues = state.get("extracted_clues", {})
+    hypotheses = state.get("hypotheses", [])
+    valid_ev_ids = {ev.id for ev in ev_list}
+
+    if _has_valid_llm_key() and ev_list:
+        try:
+            sys_prompt = load_prompt("evidence_evaluator.md")
+            ev_summary_text = "\n\n".join(
+                f"- 证据ID `{ev.id}` (来源={ev.source}, 工具={ev.tool_name}):\n  摘要: {ev.summary}\n  内容片段:\n{ev.raw_snippet[:500]}"
+                for ev in ev_list
+            )
+            user_prompt = (
+                f"【排障线索】：{json.dumps(clues, ensure_ascii=False)}\n\n"
+                f"【当前待验证假设列表】：{json.dumps([h.model_dump() for h in hypotheses], ensure_ascii=False)}\n\n"
+                f"【当前真实证据池 (State.evidence)】：\n{ev_summary_text}\n"
+            )
+            evaluator_llm = get_llm(temperature=0.0).with_structured_output(EvidenceEvaluation)
+            eval_res: EvidenceEvaluation = await evaluator_llm.ainvoke(
+                [SystemMessage(content=sys_prompt), HumanMessage(content=user_prompt)]
+            )
+
+            # 防幻觉过滤：严格校验 updated_hypotheses 中绑定的 evidence_ids 必须来自真实证据池
+            clean_hypotheses: list[Hypothesis] = []
+            for h in eval_res.updated_hypotheses:
+                filtered_ids = [eid for eid in h.evidence_ids if eid in valid_ev_ids]
+                clean_hypotheses.append(h.model_copy(update={"evidence_ids": filtered_ids}))
+
+            # 若证据不足以锁定根因，生成结构化的打回重试批注；证据充足则置空
+            if eval_res.is_sufficient:
+                retry_reason = ""
+            else:
+                reason_part = f"审查意见: {eval_res.reason}\n" if eval_res.reason else ""
+                missing_part = (
+                    "待补线索:\n" + "\n".join(f"- {c}" for c in eval_res.missing_clues)
+                    if eval_res.missing_clues
+                    else ""
+                )
+                retry_reason = (reason_part + missing_part).strip()
+
+            return {
+                "evidence_sufficient": eval_res.is_sufficient,
+                "hypotheses": clean_hypotheses or hypotheses,
+                "evaluate_retry_reason": retry_reason,
+            }
+        except Exception:
+            pass
+
+    # 全量规则兜底：若有有效证据则认为证据充足；若完全无证据则判定为不足并提供打回批注
+    is_sufficient = bool(ev_list)
+    retry_reason = (
+        ""
+        if is_sufficient
+        else "当前证据池为空，未能采集到有效日志报错、代码片段或数据库记录，线索不足，请重新规划探针方向"
+    )
+    return {
+        "evidence_sufficient": is_sufficient,
+        "evaluate_retry_reason": retry_reason,
+    }
 
 
 def _route_after_evaluate(
     state: IncidentMainState,
 ) -> Literal["hypothesis_planner_node", "generate_report_node"]:
     ev_list = state.get("evidence", [])
-    if not ev_list and state.get("loop_count", 0) < 2:
+    # 优先根据 evidence_evaluate_node 判定的 evidence_sufficient；若未设则以 bool(ev_list) 兜底
+    is_suff = state.get("evidence_sufficient")
+    if is_suff is None:
+        is_suff = bool(ev_list)
+
+    # 若证据不足以锁定根因，且外层大循环次数 < 2，则打回 hypothesis_planner_node 结合 gaps 重新规划
+    if not is_suff and state.get("loop_count", 0) < 2:
         return "hypothesis_planner_node"
     return "generate_report_node"
 
@@ -494,6 +597,7 @@ async def verify_report_node(
         return {
             "final_report": None,
             "verification_error": error_msg,
+            "gaps": [f"[防幻觉验钞拦截] {error_msg}"],
             "verify_retry_count": retry_cnt + 1,
         }
 
@@ -716,6 +820,7 @@ def build_main_incident_graph(checkpointer=None):
         _dispatch_probe_workers,
         ["probe_worker_node"],
     )
+    # 用Send()默认是 与连接
     builder.add_edge("probe_worker_node", "evidence_evaluate_node")
 
     builder.add_conditional_edges(

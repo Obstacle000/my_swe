@@ -21,7 +21,18 @@ def _has_valid_llm_key() -> bool:
     key = (settings.llm_api_key or "").strip()
     return bool(key) and not key.startswith("sk-your-") and key != "sk-placeholder"
 
-
+# {
+#   "incident_code": "INC-2026-089",
+#   "title": "...",
+#   "symptoms": "...",
+#   "root_cause": "...",
+#   "resolution": "...",
+#   "service_name": "auth-sms-service",
+#   "error_keywords": "ReadTimeoutError ...",
+#   下面的字段是qdrant特有的,其余字段hit._source和point.payload字段一样
+#   "vector_score": 0.8912# Qdrant特有
+#   "bm25_score":0.8912# ES特有
+# }
 def rrf_fuse_runbooks(
     bm25_hits: list[dict[str, Any]],
     vec_hits: list[dict[str, Any]],
@@ -35,11 +46,12 @@ def rrf_fuse_runbooks(
     """
     bm25_rank_map: dict[str, tuple[int, float]] = {}
     doc_map: dict[str, dict[str, Any]] = {}
-
+    # enumerate说多少次了,从start开始给每个元素编号,这里相当于排名
+    # qdrant和es分别算排名然后rrf算总排名
     for rank, item in enumerate(bm25_hits, start=1):
-        code = item["incident_code"]
+        code = item["incident_code"]# 就是incident_id
         bm25_rank_map[code] = (rank, float(item.get("bm25_score", 0.0)))
-        doc_map.setdefault(code, item)
+        doc_map.setdefault(code, item)# 去重,反正除了incident_id字段,ES和Qdrant的内容一样
 
     vec_rank_map: dict[str, tuple[int, float]] = {}
     for rank, item in enumerate(vec_hits, start=1):
@@ -49,11 +61,15 @@ def rrf_fuse_runbooks(
 
     fused_list: list[dict[str, Any]] = []
     for code, doc in doc_map.items():
+        # doc_map里面的检索结果是ES和Qdrant合起来的,里面每一个incident_id都不同,因为去重了
+        # 因为里面存的都是以前报错的时候存的数据可能是同一个报错存的,也可能是不同报错
         b_rank, b_score = bm25_rank_map.get(code, (999, 0.0))
         v_rank, v_score = vec_rank_map.get(code, (999, 0.0))
         rrf_score = (1.0 / (k_constant + b_rank)) + (1.0 / (k_constant + v_rank))
         effective_score = rrf_score if (b_score > 0 or v_score > 0) else 0.0
+
         fused_list.append(
+            # 每一个历史报错信息都是不同的
             {
                 "incident_code": code,
                 "title": doc.get("title", ""),
@@ -84,15 +100,28 @@ async def hybrid_retrieve_node(
     embedder = ctx["embedding"]
 
     query = state.get("current_query") or state.get("original_query", "")
-
+    # 每个 hit 长这样：
+    # {
+    #     "_index": "...",
+    #     "_id": "doc1",
+    #     "_score": 12.34,  # BM25 打分
+    #     "_source": {"title": "...", "content": "..."}
+    # }
     bm25_hits = await es_repo.search_bm25(query, limit=10)
     query_vector = await embedder.aembed_query(query)
+    # point:
+    # {
+    #     "id": 42,
+    #     "score": 0.93,
+    #     "vector":[0.1, 0.2, 0.3, ...],
+    #     "payload": {"text": "...", "source": "..."}
+    # }
     vec_hits = await qdrant_repo.search_vector(query_vector, limit=10)
-
+    # search_bm25和search_vector都不是原生的检索方法,我们只提取里面的内容部分
     docs = rrf_fuse_runbooks(bm25_hits=bm25_hits, vec_hits=vec_hits, top_k=3, k_constant=60)
     return {"retrieved_docs": docs, "current_query": query}
 
-
+# 对检索结果裁剪,如果没问题存relevant_docs,直接到pack_output节点,否则查看剩余轮数,进入rewrite_query_node
 async def grade_docs_node(
     state: CRAGSubState, runtime: Runtime[IncidentGraphContext]
 ) -> dict:
@@ -123,6 +152,7 @@ async def grade_docs_node(
             except Exception:
                 is_rel = _rule_based_grade(query, doc)
         else:
+            # 兜底
             is_rel = _rule_based_grade(query, doc)
 
         if is_rel:
@@ -206,9 +236,10 @@ async def pack_output_node(
     )
 
     return {
+        # 下面是给父图的状态字段,其余的字段全部扔掉,只返回了命中度最高的
         "historical_context": context_text,
         "crag_hit": True,
-        "evidence": [ev],
+        "evidence": [ev],# 检索命中的所有历史故障
     }
 
 
