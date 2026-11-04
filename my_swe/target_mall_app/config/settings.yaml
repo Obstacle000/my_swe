@@ -1,0 +1,12 @@
+# 微商城靶场系统配置文件 (供剧本三排查读取)
+app_name: "mall-order-service"
+env: "production"
+
+notify_sms:
+  provider: "aliyun_sms_gateway"
+  endpoint: "https://sms.example-gateway.com/v1/send"
+  timeout_seconds: 2.0
+  max_qps_limit: 50
+  # 故障剧本三：促销高峰期超过 50 QPS 时未开启本地异步队列削峰，导致大量 ConnectTimeoutError
+  sms_async_queue_enabled: false
+  retry_times: 1

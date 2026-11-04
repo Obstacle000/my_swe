@@ -1,0 +1,176 @@
+<svg viewBox="0 0 1120 800" width="1120" height="800" xmlns="http://www.w3.org/2000/svg">
+  <rect width="100%" height="100%" fill="#0f172a" />
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#94a3b8" />
+    </marker>
+    <marker id="arrow-blue" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#3b82f6" />
+    </marker>
+    <marker id="arrow-green" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#10b981" />
+    </marker>
+    <marker id="arrow-amber" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#f59e0b" />
+    </marker>
+    <marker id="arrow-red" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#ef4444" />
+    </marker>
+  </defs>
+
+  <!-- Outer Frame: IncidentMainState -->
+  <rect x="12" y="12" width="1096" height="776" rx="14" fill="none" stroke="#3b82f6" stroke-width="2" stroke-dasharray="8 5" opacity="0.7" />
+  <text x="28" y="38" fill="#60a5fa" font-family="sans-serif" font-size="14" font-weight="bold">主图全局状态: IncidentMainState (thread_id = incident_id)</text>
+
+  <!-- START -> Node 1: Triage -->
+  <circle cx="65" cy="95" r="22" fill="#1e293b" stroke="#3b82f6" stroke-width="2" />
+  <text x="65" y="99" text-anchor="middle" fill="#93c5fd" font-family="sans-serif" font-size="12" font-weight="bold">START</text>
+  <line x1="87" y1="95" x2="125" y2="95" stroke="#3b82f6" stroke-width="2" marker-end="url(#arrow-blue)" />
+
+  <rect x="130" y="65" width="175" height="60" rx="8" fill="#1e293b" stroke="#3b82f6" stroke-width="2" />
+  <text x="217" y="88" text-anchor="middle" fill="#f8fafc" font-family="sans-serif" font-size="13" font-weight="bold">1. triage_node</text>
+  <text x="217" y="108" text-anchor="middle" fill="#94a3b8" font-family="sans-serif" font-size="12">提取线索 extracted_clues</text>
+
+  <line x1="305" y1="95" x2="350" y2="95" stroke="#3b82f6" stroke-width="2" marker-end="url(#arrow-blue)" />
+
+  <!-- SUBGRAPH 1: CRAGSubState -->
+  <rect x="355" y="25" width="445" height="145" rx="10" fill="#2e1065" fill-opacity="0.35" stroke="#a855f7" stroke-width="2" />
+  <text x="370" y="47" fill="#c084fc" font-family="sans-serif" font-size="12" font-weight="bold">子图 1: CRAGSubState (历史故障混合检索自省子图)</text>
+
+  <rect x="370" y="62" width="130" height="52" rx="6" fill="#1e1b4b" stroke="#a855f7" stroke-width="1.5" />
+  <text x="435" y="84" text-anchor="middle" fill="#f8fafc" font-family="sans-serif" font-size="12" font-weight="bold">ES + Qdrant</text>
+  <text x="435" y="101" text-anchor="middle" fill="#cbd5e1" font-family="sans-serif" font-size="12">RRF 混合重排</text>
+
+  <line x1="500" y1="88" x2="532" y2="88" stroke="#a855f7" stroke-width="1.5" marker-end="url(#arrow)" />
+
+  <polygon points="585,58 638,88 585,118 532,88" fill="#1e1b4b" stroke="#a855f7" stroke-width="1.5" />
+  <text x="585" y="85" text-anchor="middle" fill="#f8fafc" font-family="sans-serif" font-size="12" font-weight="bold">Grader</text>
+  <text x="585" y="100" text-anchor="middle" fill="#c084fc" font-family="sans-serif" font-size="12">相关吗?</text>
+
+  <line x1="638" y1="88" x2="675" y2="88" stroke="#ef4444" stroke-width="1.5" marker-end="url(#arrow-red)" />
+  <text x="656" y="80" text-anchor="middle" fill="#f87171" font-family="sans-serif" font-size="12">no</text>
+
+  <rect x="678" y="64" width="106" height="48" rx="6" fill="#1e1b4b" stroke="#f87171" stroke-width="1.5" />
+  <text x="731" y="85" text-anchor="middle" fill="#f8fafc" font-family="sans-serif" font-size="12" font-weight="bold">Query 重写</text>
+  <text x="731" y="101" text-anchor="middle" fill="#fca5a5" font-family="sans-serif" font-size="12">retry &lt; 2</text>
+
+  <path d="M 731 112 L 731 152 L 435 152 L 435 114" fill="none" stroke="#f87171" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#arrow-red)" />
+  <text x="585" y="146" text-anchor="middle" fill="#fca5a5" font-family="sans-serif" font-size="12">换词重搜 (rewritten_query)</text>
+
+  <!-- CRAG -> Node 3: Hypothesis Planner -->
+  <path d="M 585 118 L 585 190 L 935 190 L 935 128" fill="none" stroke="#10b981" stroke-width="2" marker-end="url(#arrow-green)" />
+  <text x="755" y="183" text-anchor="middle" fill="#34d399" font-family="sans-serif" font-size="12">写回 historical_cases &amp; evidence_ledger</text>
+
+  <rect x="835" y="62" width="245" height="65" rx="8" fill="#1e293b" stroke="#3b82f6" stroke-width="2" />
+  <text x="957" y="86" text-anchor="middle" fill="#f8fafc" font-family="sans-serif" font-size="13" font-weight="bold">3. hypothesis_planner_node</text>
+  <text x="957" y="106" text-anchor="middle" fill="#93c5fd" font-family="sans-serif" font-size="12">生成 2~3 个竞争假设 Hypothesis</text>
+
+  <!-- Send API Arrows to Subgraph 2 -->
+  <path d="M 957 127 L 957 220 L 220 220 L 220 265" fill="none" stroke="#10b981" stroke-width="2" stroke-dasharray="5 3" marker-end="url(#arrow-green)" />
+  <path d="M 957 127 L 957 220 L 560 220 L 560 265" fill="none" stroke="#10b981" stroke-width="2" stroke-dasharray="5 3" marker-end="url(#arrow-green)" />
+  <path d="M 957 127 L 957 220 L 890 220 L 890 265" fill="none" stroke="#10b981" stroke-width="2" stroke-dasharray="5 3" marker-end="url(#arrow-green)" />
+  <rect x="445" y="206" width="235" height="24" rx="12" fill="#064e3b" stroke="#10b981" stroke-width="1.5" />
+  <text x="562" y="222" text-anchor="middle" fill="#6ee7b7" font-family="sans-serif" font-size="12" font-weight="bold">LangGraph Send() 动态并行派发</text>
+
+  <!-- SUBGRAPH 2: Parallel ProbeWorkerState -->
+  <rect x="45" y="250" width="1030" height="150" rx="10" fill="#064e3b" fill-opacity="0.28" stroke="#10b981" stroke-width="2" />
+  <text x="65" y="272" fill="#34d399" font-family="sans-serif" font-size="12" font-weight="bold">子图 2: ProbeWorkerState × N (多源探针并行取证子图 —— 内部对话用 worker_messages 隔离，退出即销毁)</text>
+
+  <rect x="75" y="288" width="290" height="92" rx="8" fill="#0f172a" stroke="#10b981" stroke-width="1.5" />
+  <text x="220" y="312" text-anchor="middle" fill="#6ee7b7" font-family="sans-serif" font-size="13" font-weight="bold">Worker A: 日志探针 (probe_type='log')</text>
+  <text x="220" y="334" text-anchor="middle" fill="#cbd5e1" font-family="sans-serif" font-size="12">工具: search_error_logs / get_trace</text>
+  <text x="220" y="354" text-anchor="middle" fill="#94a3b8" font-family="sans-serif" font-size="12">自动签发: [ev_log:01] + redact 脱敏</text>
+
+  <rect x="415" y="288" width="290" height="92" rx="8" fill="#0f172a" stroke="#10b981" stroke-width="1.5" />
+  <text x="560" y="312" text-anchor="middle" fill="#6ee7b7" font-family="sans-serif" font-size="13" font-weight="bold">Worker B: 代码探针 (probe_type='code')</text>
+  <text x="560" y="334" text-anchor="middle" fill="#cbd5e1" font-family="sans-serif" font-size="12">工具: ls / grep / read_file / git_blame</text>
+  <text x="560" y="354" text-anchor="middle" fill="#94a3b8" font-family="sans-serif" font-size="12">自动签发: [ev_code:02] (限额 15k 字符)</text>
+
+  <rect x="755" y="288" width="290" height="92" rx="8" fill="#0f172a" stroke="#10b981" stroke-width="1.5" />
+  <text x="900" y="312" text-anchor="middle" fill="#6ee7b7" font-family="sans-serif" font-size="13" font-weight="bold">Worker C: 数据探针 (probe_type='db')</text>
+  <text x="900" y="334" text-anchor="middle" fill="#cbd5e1" font-family="sans-serif" font-size="12">工具: inspect_schema / readonly_sql</text>
+  <text x="900" y="354" text-anchor="middle" fill="#94a3b8" font-family="sans-serif" font-size="12">自动签发: [ev_db:03] (核查脏数据)</text>
+
+  <!-- Merge via operator.add into Node 4: Compressor -->
+  <path d="M 220 380 L 220 435 L 295 435" fill="none" stroke="#10b981" stroke-width="2" marker-end="url(#arrow-green)" />
+  <path d="M 560 380 L 560 435 L 525 435" fill="none" stroke="#10b981" stroke-width="2" marker-end="url(#arrow-green)" />
+  <path d="M 900 380 L 900 415 L 525 415 L 525 435" fill="none" stroke="#10b981" stroke-width="1.5" />
+  <text x="720" y="410" fill="#34d399" font-family="sans-serif" font-size="12">operator.add 自动合并 evidence_ledger &amp; gaps</text>
+
+  <!-- Node 4: Context Compressor -->
+  <rect x="295" y="425" width="230" height="62" rx="8" fill="#1e293b" stroke="#3b82f6" stroke-width="2" />
+  <text x="410" y="450" text-anchor="middle" fill="#f8fafc" font-family="sans-serif" font-size="13" font-weight="bold">4. context_compressor_node</text>
+  <text x="410" y="470" text-anchor="middle" fill="#93c5fd" font-family="sans-serif" font-size="12">更新假设状态 &amp; 折叠已排除分支</text>
+
+  <!-- Conditional Edge: Enough Evidence? -->
+  <line x1="295" y1="456" x2="215" y2="456" stroke="#3b82f6" stroke-width="2" marker-end="url(#arrow-blue)" />
+  <polygon points="150,422 215,456 150,490 85,456" fill="#1e293b" stroke="#60a5fa" stroke-width="1.5" />
+  <text x="150" y="453" text-anchor="middle" fill="#f8fafc" font-family="sans-serif" font-size="12" font-weight="bold">证据足够?</text>
+  <text x="150" y="469" text-anchor="middle" fill="#93c5fd" font-family="sans-serif" font-size="12">锁定根因</text>
+
+  <!-- Loop back to Planner if not enough -->
+  <path d="M 85 456 L 28 456 L 28 232 L 957 232 L 957 128" fill="none" stroke="#f59e0b" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#arrow-amber)" />
+  <text x="58" y="350" fill="#fbbf24" font-family="sans-serif" font-size="12">不足: 继续深挖</text>
+
+  <!-- Enough -> Node 5: Draft Report -->
+  <line x1="150" y1="490" x2="150" y2="545" stroke="#10b981" stroke-width="2" marker-end="url(#arrow-green)" />
+  <text x="180" y="520" fill="#34d399" font-family="sans-serif" font-size="12">充足 (yes)</text>
+
+  <rect x="55" y="550" width="190" height="62" rx="8" fill="#1e293b" stroke="#3b82f6" stroke-width="2" />
+  <text x="150" y="575" text-anchor="middle" fill="#f8fafc" font-family="sans-serif" font-size="13" font-weight="bold">5. draft_report_node</text>
+  <text x="150" y="595" text-anchor="middle" fill="#93c5fd" font-family="sans-serif" font-size="12">填答题卡 ReportDraft</text>
+
+  <line x1="245" y1="581" x2="295" y2="581" stroke="#3b82f6" stroke-width="2" marker-end="url(#arrow-blue)" />
+
+  <!-- Node 6: Anti-Hallucination Verifier -->
+  <polygon points="385,536 475,581 385,626 295,581" fill="#1e293b" stroke="#f43f5e" stroke-width="2" />
+  <text x="385" y="576" text-anchor="middle" fill="#fda4af" font-family="sans-serif" font-size="12" font-weight="bold">6. 防幻觉验钞机</text>
+  <text x="385" y="593" text-anchor="middle" fill="#f8fafc" font-family="sans-serif" font-size="12">valid_refs 校验</text>
+
+  <!-- Reject back to Draft Report -->
+  <path d="M 385 626 L 385 655 L 150 655 L 150 612" fill="none" stroke="#ef4444" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#arrow-red)" />
+  <text x="268" y="648" text-anchor="middle" fill="#f87171" font-family="sans-serif" font-size="12">伪造/缺 evidence_id 打回重写 (verify_retry &lt; 2)</text>
+
+  <!-- Pass -> SUBGRAPH 3: PatchSelfHealSubState -->
+  <line x1="475" y1="581" x2="530" y2="581" stroke="#10b981" stroke-width="2" marker-end="url(#arrow-green)" />
+  <text x="502" y="570" text-anchor="middle" fill="#34d399" font-family="sans-serif" font-size="12">通过</text>
+
+  <rect x="535" y="500" width="540" height="155" rx="10" fill="#78350f" fill-opacity="0.3" stroke="#f59e0b" stroke-width="2" />
+  <text x="552" y="522" fill="#fbbf24" font-family="sans-serif" font-size="12" font-weight="bold">子图 3: PatchSelfHealSubState (Git Worktree 隔离沙箱代码自愈子图)</text>
+
+  <rect x="552" y="540" width="165" height="60" rx="6" fill="#1c1917" stroke="#f59e0b" stroke-width="1.5" />
+  <text x="634" y="564" text-anchor="middle" fill="#f8fafc" font-family="sans-serif" font-size="12" font-weight="bold">沙箱 edit_file 改代码</text>
+  <text x="634" y="584" text-anchor="middle" fill="#fcd34d" font-family="sans-serif" font-size="12">生成 patch_diff</text>
+
+  <line x1="717" y1="570" x2="758" y2="570" stroke="#f59e0b" stroke-width="1.5" marker-end="url(#arrow-amber)" />
+
+  <polygon points="825,532 892,570 825,608 758,570" fill="#1c1917" stroke="#f59e0b" stroke-width="1.5" />
+  <text x="825" y="567" text-anchor="middle" fill="#f8fafc" font-family="sans-serif" font-size="12" font-weight="bold">跑 pytest</text>
+  <text x="825" y="583" text-anchor="middle" fill="#fcd34d" font-family="sans-serif" font-size="12">单测通过?</text>
+
+  <line x1="892" y1="570" x2="930" y2="570" stroke="#ef4444" stroke-width="1.5" marker-end="url(#arrow-red)" />
+  <rect x="932" y="544" width="128" height="52" rx="6" fill="#1c1917" stroke="#f87171" stroke-width="1.5" />
+  <text x="996" y="566" text-anchor="middle" fill="#fca5a5" font-family="sans-serif" font-size="12" font-weight="bold">捕获报错堆栈</text>
+  <text x="996" y="584" text-anchor="middle" fill="#f8fafc" font-family="sans-serif" font-size="12">test_error_log</text>
+
+  <path d="M 996 596 L 996 638 L 634 638 L 634 600" fill="none" stroke="#f87171" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#arrow-red)" />
+  <text x="815" y="632" text-anchor="middle" fill="#fca5a5" font-family="sans-serif" font-size="12">单测报错反馈自愈重改 (retry_count &lt; 3)</text>
+
+  <!-- Subgraph 3 -> HITL Interrupt -->
+  <path d="M 825 608 L 825 685 L 680 685 L 680 705" fill="none" stroke="#10b981" stroke-width="2" marker-end="url(#arrow-green)" />
+  <text x="755" y="678" text-anchor="middle" fill="#34d399" font-family="sans-serif" font-size="12">写回 patch_diff &amp; test_passed=True</text>
+
+  <rect x="545" y="705" width="250" height="58" rx="8" fill="#31102f" stroke="#ec4899" stroke-width="2" />
+  <text x="670" y="730" text-anchor="middle" fill="#f472b6" font-family="sans-serif" font-size="13" font-weight="bold">7. human_approval_node (HITL)</text>
+  <text x="670" y="749" text-anchor="middle" fill="#fbcfe8" font-family="sans-serif" font-size="12">interrupt() 挂起等待前端点击批准</text>
+
+  <!-- HITL -> Apply & Evolve -> END -->
+  <line x1="795" y1="734" x2="845" y2="734" stroke="#10b981" stroke-width="2" marker-end="url(#arrow-green)" />
+  <rect x="850" y="705" width="175" height="58" rx="8" fill="#1e293b" stroke="#10b981" stroke-width="2" />
+  <text x="937" y="730" text-anchor="middle" fill="#6ee7b7" font-family="sans-serif" font-size="12" font-weight="bold">8. apply_and_evolve</text>
+  <text x="937" y="749" text-anchor="middle" fill="#cbd5e1" font-family="sans-serif" font-size="12">合并代码 + 写回知识库</text>
+
+  <line x1="1025" y1="734" x2="1055" y2="734" stroke="#10b981" stroke-width="2" marker-end="url(#arrow-green)" />
+  <circle cx="1078" cy="734" r="20" fill="#064e3b" stroke="#10b981" stroke-width="2" />
+  <text x="1078" y="738" text-anchor="middle" fill="#6ee7b7" font-family="sans-serif" font-size="12" font-weight="bold">END</text>
+</svg>
