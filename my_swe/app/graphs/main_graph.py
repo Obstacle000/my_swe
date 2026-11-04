@@ -394,13 +394,14 @@ async def generate_report_node(
                 user_prompt += f"\n\n【上一轮防幻觉校验打回原因，请立即修正】：\n{verify_err}\n"
 
             report_llm = get_llm(temperature=0.0).with_structured_output(ReportDraft)
+
             draft: ReportDraft = await report_llm.ainvoke(
                 [SystemMessage(content=sys_prompt), HumanMessage(content=user_prompt)]
             )
             return {"report_draft": draft}
         except Exception:
             pass
-
+    # 兜底逻辑
     draft = _build_grounded_report_draft(clues, hypotheses, ev_pool)
     return {"report_draft": draft}
 
@@ -420,16 +421,19 @@ def _build_grounded_report_draft(
     hypotheses: list[Hypothesis],
     ev_pool: list[Evidence],
 ) -> ReportDraft:
+    """动态报告草稿组装器：纯粹从现场真实采集到的证据池动态提取事实与合法 ID，零特定业务硬编码"""
     all_ids = [ev.id for ev in ev_pool]
-    log_ids = [ev.id for ev in ev_pool if ev.id.startswith("ev_log:")] or all_ids[:1]
-    code_ids = (
-        [ev.id for ev in ev_pool if ev.id.startswith(("ev_code:", "ev_git:"))]
-        or all_ids[:1]
-    )
-    db_ids = [ev.id for ev in ev_pool if ev.id.startswith("ev_db:")] or all_ids[:1]
-    hist_ids = [ev.id for ev in ev_pool if ev.id.startswith("ev_hist:")] or log_ids
+    log_evs = [ev for ev in ev_pool if ev.id.startswith("ev_log:")]
+    code_evs = [ev for ev in ev_pool if ev.id.startswith(("ev_code:", "ev_git:"))]
+    db_evs = [ev for ev in ev_pool if ev.id.startswith("ev_db:")]
+    hist_evs = [ev for ev in ev_pool if ev.id.startswith("ev_hist:")]
 
-    mod_hint = clues.get("module_hint", "order")
+    log_ids = [e.id for e in log_evs] or all_ids[:1]
+    code_ids = [e.id for e in code_evs] or all_ids[:1]
+    db_ids = [e.id for e in db_evs] or all_ids[:1]
+    hist_ids = [e.id for e in hist_evs] or log_ids
+
+    # 1. 动态更新假设列表的证据绑定
     updated_hyps: list[Hypothesis] = []
     for h in hypotheses:
         if h.probe_type == "log":
@@ -439,134 +443,84 @@ def _build_grounded_report_draft(
         else:
             ref = db_ids
         updated_hyps.append(
-            Hypothesis(
-                id=h.id,
-                title=h.title,
-                probe_type=h.probe_type,
-                assessment="supported",
-                evidence_ids=ref,
+            h.model_copy(update={"assessment": "supported", "evidence_ids": ref})
+        )
+
+    # 2. 动态提取异常现象
+    if log_evs:
+        problem_text = f"运行态异常堆栈记录：{log_evs[0].summary}"
+    else:
+        api = clues.get("api_path", "业务服务")
+        kw = clues.get("error_keyword", "异常")
+        problem_text = f"系统监测到 {api} 接口异常 ({kw})，导致用户请求处理失败。"
+
+    # 3. 动态提取根因事实
+    cause_evidence_ids: list[str] = []
+    if code_evs:
+        cause_text = f"代码与配置缺陷定位：{code_evs[0].summary}"
+        cause_evidence_ids.extend([e.id for e in code_evs[:2]])
+    elif db_evs:
+        cause_text = f"数据库业务记录异常：{db_evs[0].summary}"
+        cause_evidence_ids.extend([e.id for e in db_evs[:2]])
+    else:
+        cause_text = f"经探针排查，异常与 {clues.get('module_hint', '核心')} 模块外部依赖或配置相关。"
+        cause_evidence_ids.extend(all_ids[:2])
+
+    if db_evs and db_evs[0].id not in cause_evidence_ids:
+        cause_evidence_ids.append(db_evs[0].id)
+
+    # 4. 判断是否需要代码补丁修复 (若涉及 Python 代码文件则需要代码 Patch，若仅配置或网关问题则无需修改源码)
+    need_patch = any(
+        e.id.startswith("ev_code:") and ".py" in e.summary
+        for e in code_evs
+    )
+
+    # 5. 动态构建各章节结论声明
+    summary_claim = Claim(
+        text=f"故障排障结论：{cause_text}。已完成现场取证与根因锁定。",
+        evidence_ids=all_ids[:3] or log_ids,
+    )
+    problem_claim = Claim(
+        text=problem_text,
+        evidence_ids=log_ids,
+    )
+    prev_claims = (
+        [
+            Claim(
+                text=f"CRAG 混合检索命中历史相似排障记录：{hist_evs[0].summary}",
+                evidence_ids=hist_ids,
             )
-        )
+        ]
+        if hist_evs
+        else []
+    )
 
-    if mod_hint == "sms":
-        return ReportDraft(
-            summary=[
-                Claim(
-                    text="登录验证码接口 /api/auth/send-sms 大面积超时系历史故障 INC-2026-089 复发：主用阿里云短信网关限流且本地未开启自动降级。",
-                    evidence_ids=hist_ids + log_ids,
-                )
-            ],
-            problem=[
-                Claim(
-                    text="线上 /api/auth/send-sms 接口密集抛出 ReadTimeoutError (read timeout=2.0)，导致用户无法接收登录短信验证码。",
-                    evidence_ids=log_ids,
-                )
-            ],
-            previous_occurrence=[
-                Claim(
-                    text="CRAG 混合检索命中历史故障 INC-2026-089，报错特征与本次完全一致。",
-                    evidence_ids=hist_ids,
-                )
-            ],
-            impact=[
-                Claim(
-                    text="影响全站短信验证码登录链路，需立即执行网关通道切换。",
-                    evidence_ids=log_ids,
-                )
-            ],
-            cause=[
-                Claim(
-                    text="第三方主用短信网关 (aliyun_primary) 高峰期限流超时，而 config/settings.yaml 中 fallback_enabled 为 false，未能自动切换至备用通道 tencent_backup。",
-                    evidence_ids=code_ids + hist_ids,
-                )
-            ],
-            next_steps=[
-                Claim(
-                    text="将 config/settings.yaml 中的 sms_gateway.provider 切换为 tencent_backup，并将 fallback_enabled 设为 true（属配置与外部网关问题，无需修改 Python 业务代码）。",
-                    evidence_ids=code_ids + hist_ids,
-                )
-            ],
-            hypotheses=updated_hyps,
-            gaps=[],
-            questions=[],
-            need_code_patch=False,
-        )
-
-    if mod_hint == "pricing":
-        return ReportDraft(
-            summary=[
-                Claim(
-                    text="用户 10087 (VIP 2 黄金会员) 下单未享受 8 折优惠，根因是 pricing_service.py 第 42 行误将边界条件写成 `vip_level > 2`。",
-                    evidence_ids=code_ids + db_ids,
-                )
-            ],
-            problem=[
-                Claim(
-                    text="用户 10087 购买原价 200.00 元商品，实付金额仍为 200.00 元（应为 160.00 元），日志显示 applied_ratio=1.0。",
-                    evidence_ids=log_ids + db_ids,
-                )
-            ],
-            previous_occurrence=[],
-            impact=[
-                Claim(
-                    text="导致所有 vip_level == 2 的黄金会员在结算时均无法命中 8 折阶梯优惠。",
-                    evidence_ids=code_ids + db_ids,
-                )
-            ],
-            cause=[
-                Claim(
-                    text="app/services/pricing_service.py 第 42 行 `elif vip_level > 2:` 存在边界开闭区间缺陷（当 vip_level==3 时已被上一分支拦截，导致 vip_level==2 落入默认原价分支）。",
-                    evidence_ids=code_ids,
-                )
-            ],
-            next_steps=[
-                Claim(
-                    text="在隔离沙箱中将 app/services/pricing_service.py 第 42 行的 `elif vip_level > 2:` 修复为 `elif vip_level >= 2:`，并运行 pytest 回归单测。",
-                    evidence_ids=code_ids,
-                )
-            ],
-            hypotheses=updated_hyps,
-            gaps=[],
-            questions=[],
-            need_code_patch=True,
-        )
+    impact_claim = Claim(
+        text=f"影响 {clues.get('module_hint', '业务')} 模块相关用户业务请求及后续链路正常流转。",
+        evidence_ids=(log_ids + db_ids)[:3] or all_ids[:2],
+    )
+    cause_claim = Claim(
+        text=cause_text,
+        evidence_ids=cause_evidence_ids or all_ids[:2],
+    )
+    next_step_claim = Claim(
+        text="进入沙箱自愈环境应用代码修复补丁并执行自动化测试验证。"
+        if need_patch
+        else "调整系统配置参数或切换通道，并触发线上健康检查。",
+        evidence_ids=(code_ids + hist_ids)[:2] or all_ids[:2],
+    )
 
     return ReportDraft(
-        summary=[
-            Claim(
-                text="用户 10086 结算订单报 HTTP 500 的根因是：其使用的折扣券 CPN-999 (类型为 RATE) 在数据库中 discount_amount 字段为 NULL，而 order_service.py:64 直接用 float 减去 None 引发 TypeError。",
-                evidence_ids=log_ids + code_ids + db_ids,
-            )
-        ],
-        problem=[
-            Claim(
-                text="调用 /api/orders/checkout (trace_id=tr-88910-a1) 抛出异常 `TypeError: unsupported operand type(s) for -: 'float' and 'NoneType'`。",
-                evidence_ids=log_ids,
-            )
-        ],
-        previous_occurrence=[],
-        impact=[
-            Claim(
-                text="所有使用 RATE 比率折扣券的用户在订单结算时均会触发 500 崩溃，订单状态停留在 FAILED_500。",
-                evidence_ids=log_ids + db_ids,
-            )
-        ],
-        cause=[
-            Claim(
-                text="数据库 mall_coupons 表中 CPN-999 的 coupon_type='RATE'、discount_rate=0.85、discount_amount=NULL；而 app/services/order_service.py 第 64 行未判断 coupon_type 分支，直接执行 `base_price - coupon['discount_amount']` 导致空指针异常。",
-                evidence_ids=code_ids + db_ids,
-            )
-        ],
-        next_steps=[
-            Claim(
-                text="在沙箱中修改 app/services/order_service.py 第 62-66 行，区分 RATE 折扣券 (`base_price * discount_rate`) 与 CASH 满减券逻辑，并通过 pytest 单测验证。",
-                evidence_ids=code_ids,
-            )
-        ],
-        hypotheses=updated_hyps,
+        summary=[summary_claim],
+        problem=[problem_claim],
+        previous_occurrence=prev_claims,
+        impact=[impact_claim],
+        cause=[cause_claim],
+        next_steps=[next_step_claim],
+        hypotheses=updated_hyps or hypotheses,
         gaps=[],
         questions=[],
-        need_code_patch=True,
+        need_code_patch=need_patch,
     )
 
 

@@ -136,7 +136,7 @@ def verify_and_finalize_report(
     prev_str = "\n".join(prev_lines) if prev_lines else "未命中历史同类故障"
     impact_str = "\n".join(impact_lines) if impact_lines else "影响当前接口关联业务流程"
     cause_str = "\n".join(cause_lines)
-
+    # 纯净信息提取加密,以便查重
     digest_payload = digest_fields(
         summary=summary_str,
         problem=problem_str,
