@@ -16,9 +16,8 @@ from app.graphs.context import IncidentGraphContext
 from app.graphs.state import ProbeWorkerState
 from app.prompts.loader import load_prompt
 from app.schemas.incident_schemas import Evidence, TriageClues
-from app.tools.code_tools import CODE_TOOLS
-from app.tools.db_tools import DB_TOOLS
-from app.tools.log_tools import LOG_TOOLS
+from app.mcp.code_server import CODE_TOOLS, code_tools_by_name
+from app.mcp.probe_server import DB_TOOLS, LOG_TOOLS
 
 _TOOLSET_BY_PROBE_TYPE = {
     "log": LOG_TOOLS,
@@ -26,7 +25,7 @@ _TOOLSET_BY_PROBE_TYPE = {
     "db": DB_TOOLS,
 }
 
-_CODE_TOOLS_BY_NAME = {t.name: t for t in CODE_TOOLS}
+_CODE_TOOLS_BY_NAME = code_tools_by_name
 
 
 def _has_valid_llm_key() -> bool:
@@ -239,9 +238,12 @@ async def _execute_tool_with_context(
             return f"查询成功，但返回 0 行记录 (SQL: {sql_query})。"
         return json.dumps(result, ensure_ascii=False, indent=2)
 
-    code_tool = _CODE_TOOLS_BY_NAME.get(t_name)
-    if code_tool is not None:
-        return str(code_tool.invoke(t_args))
+    code_impl = _CODE_TOOLS_BY_NAME.get(t_name)
+    if code_impl is not None:
+        if callable(code_impl):
+            return str(code_impl(**t_args))
+        if hasattr(code_impl, "invoke"):
+            return str(code_impl.invoke(t_args))
 
     return f"未找到工具: {t_name}"
 

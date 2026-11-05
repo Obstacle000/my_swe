@@ -13,9 +13,10 @@ from langgraph.runtime import Runtime
 from app.config import PROJECT_ROOT, get_llm, settings
 from app.graphs.context import IncidentGraphContext
 from app.graphs.state import PatchSelfHealSubState
+from app.mcp.client import load_sandbox_mcp_tools
+from app.mcp.sandbox_server import edit_file_in_sandbox, run_pytest_in_sandbox
 from app.prompts.loader import load_prompt
 from app.schemas.incident_schemas import Evidence
-from app.tools.sandbox_tools import SANDBOX_TOOLS, edit_file_in_sandbox
 
 
 def _has_valid_llm_key() -> bool:
@@ -164,24 +165,24 @@ def _apply_grounded_fallback_fix(
             "    return round(max(final_price, 0.0), 2)"
         )
         if old_pattern in code_text:
-            edit_file_in_sandbox.invoke({
-                "sandbox_dir": sandbox_dir,
-                "rel_file_path": rel_target,
-                "old_text": old_pattern,
-                "new_text": new_pattern,
-            })
+            edit_file_in_sandbox(
+                sandbox_dir=sandbox_dir,
+                rel_file_path=rel_target,
+                old_text=old_pattern,
+                new_text=new_pattern,
+            )
             return
 
     if "vip_level" in report_cause.lower() or "pricing_service" in rel_target:
         old_pattern = "    if user.vip_level > 2:\n        return round(amount * 0.9, 2)"
         new_pattern = "    if user.vip_level >= 2:\n        return round(amount * 0.9, 2)"
         if old_pattern in code_text:
-            edit_file_in_sandbox.invoke({
-                "sandbox_dir": sandbox_dir,
-                "rel_file_path": rel_target,
-                "old_text": old_pattern,
-                "new_text": new_pattern,
-            })
+            edit_file_in_sandbox(
+                sandbox_dir=sandbox_dir,
+                rel_file_path=rel_target,
+                old_text=old_pattern,
+                new_text=new_pattern,
+            )
             return
 
 
@@ -245,7 +246,13 @@ async def generate_patch_node(
                 f"当前文件内容如下：\n```python\n{current_code}\n```\n"
                 "请直接调用 `edit_file_in_sandbox` 工具完成修复。"
             )
-            llm_coder = get_llm(temperature=0.0).bind_tools(SANDBOX_TOOLS)
+            # 优先通过官方 MCP Client 动态向 FastMCP 沙箱服务端拉取标准工具集
+            try:
+                mcp_tools = await load_sandbox_mcp_tools()
+            except Exception:
+                mcp_tools = []
+
+            llm_coder = get_llm(temperature=0.0).bind_tools(mcp_tools) if mcp_tools else get_llm(temperature=0.0)
             ai_msg = await llm_coder.ainvoke(
                 [SystemMessage(content=sys_prompt), HumanMessage(content=user_msg)]
             )
@@ -259,8 +266,18 @@ async def generate_patch_node(
                         args["old_text"] = args.pop("old_code")
                     if "new_code" in args and "new_text" not in args:
                         args["new_text"] = args.pop("new_code")
-                    res = str(edit_file_in_sandbox.invoke(args))
-                    if "成功更新沙箱文件" in res:
+
+                    target_tool = next((t for t in mcp_tools if t.name == "edit_file_in_sandbox"), None)
+                    if target_tool is not None and hasattr(target_tool, "ainvoke"):
+                        res_val = await target_tool.ainvoke(args)
+                    else:
+                        res_val = edit_file_in_sandbox(
+                            sandbox_dir=args["sandbox_dir"],
+                            rel_file_path=args["rel_file_path"],
+                            old_text=args["old_text"],
+                            new_text=args["new_text"],
+                        )
+                    if "成功更新沙箱文件" in str(res_val):
                         applied_via_llm = True
         except Exception:
             applied_via_llm = False
@@ -330,29 +347,13 @@ async def run_pytest_node(
     test_file_path = Path(sandbox_dir) / "tests" / "test_order_service.py"
     test_target = str(test_file_path) if test_file_path.exists() else "tests/"
 
-    cmd = [
-        sys.executable,
-        "-m",
-        "pytest",
-        f"--rootdir={sandbox_dir}",
-    ]
-    ini_path = Path(sandbox_dir) / "pytest.ini"
-    if ini_path.exists():
-        cmd.extend(["-c", str(ini_path)])
-    cmd.extend([test_target, "-k", k_expr, "-v", "--tb=short"])
-
+    # 优先通过 FastMCP 沙箱服务端协议执行定向单测验证
     try:
-        proc = subprocess.run(
-            cmd,
-            cwd=sandbox_dir,
-            capture_output=True,
-            text=True,
-            timeout=20,
-        )
-        output = (proc.stdout + "\n" + proc.stderr).strip()
-        passed = proc.returncode == 0
+        res = run_pytest_in_sandbox(sandbox_dir=sandbox_dir, k_expr=k_expr)
+        passed = bool(res.get("passed", False))
+        output = str(res.get("output", ""))
     except Exception as exc:
-        output = f"pytest 执行异常: {exc}"
+        output = f"FastMCP 单测执行异常: {exc}"
         passed = False
 
     return {
