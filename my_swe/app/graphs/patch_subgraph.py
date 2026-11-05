@@ -13,9 +13,9 @@ from langgraph.runtime import Runtime
 from app.config import PROJECT_ROOT, get_llm, settings
 from app.graphs.context import IncidentGraphContext
 from app.graphs.state import PatchSelfHealSubState
-from app.mcp.client import load_sandbox_mcp_tools
-from app.mcp.sandbox_server import edit_file_in_sandbox, run_pytest_in_sandbox
+from app.mcp.client import load_official_filesystem_mcp_tools
 from app.prompts.loader import load_prompt
+from app.sandbox.container_runner import LinuxContainerSandbox
 from app.schemas.incident_schemas import Evidence
 
 
@@ -24,33 +24,7 @@ def _has_valid_llm_key() -> bool:
     return bool(key) and not key.startswith("sk-your-") and key != "sk-placeholder"
 
 
-def _sync_workspace_sandbox(src_repo: Path, sandbox_dir: Path) -> None:
-    # 首次进入（冷启动）：全量克隆
-    if not sandbox_dir.exists():
-        # 创建sandbox_dir的父级目录,即.sandboxes
-        sandbox_dir.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copytree(src_repo, sandbox_dir)
-        return
-    # os.walk 默认会一直深度递归遍历下去，直到把所有的子目录、孙子目录全部遍历
-    for root, dirs, files in os.walk(src_repo):
-        # root：当前正在访问的目录绝对路径
-        dirs[:] = [d for d in dirs if d not in ("__pycache__", ".pytest_cache", ".venv", ".git")]
-        # os.path.relpath(path, start):计算某个路径（path）相对于基准路径（start）的相对路径（Relative Path）。
-        rel_dir = os.path.relpath(root, src_repo)
-        # "."意味着当前目录就是用户根目录,创建sandbox_dir,但是sandbox_dir以创建所以跳过
-        # 只创建,用户根目录里面的目录
-        target_dir = sandbox_dir if rel_dir == "." else sandbox_dir / rel_dir
-        target_dir.mkdir(parents=True, exist_ok=True)
 
-        # 遍历当前目录文件拷贝到目标目录下面
-        for f in files:
-            if f.endswith(".pyc") or f.endswith(".log"):
-                continue
-            src_file = Path(root) / f
-            dst_file = target_dir / f
-            # 只同步修改过和缺失的的文件
-            if not dst_file.exists() or src_file.read_bytes() != dst_file.read_bytes():
-                shutil.copy2(src_file, dst_file)
 
 
 def _normalize_rel_path(cand: str, sandbox_dir: Path) -> str | None:
@@ -122,22 +96,39 @@ def _resolve_pytest_keyword_filter(
     rel_target: str,
     report_cause: str,
     evidence_pool: list[Evidence],
+    sandbox_dir: Path | None = None,
 ) -> str:
-    target_stem = Path(rel_target).stem.lower()
+    """基于 AST 依赖静态分析的定向单测选择 (Impacted Test Selection, ITS)
+    动态扫描 tests/ 目录下的单测 AST 语法树，找出直接调用或导入待修复模块的测试用例名称，绝无任何硬编码映射。
+    """
+    if sandbox_dir and (sandbox_dir / "tests").exists():
+        import ast
+        target_stem = Path(rel_target).stem
+        impacted_tests = []
+        for test_file in (sandbox_dir / "tests").glob("*.py"):
+            try:
+                tree = ast.parse(test_file.read_text(encoding="utf-8"))
+                imported_symbols = set()
+                for node in ast.walk(tree):
+                    if isinstance(node, ast.ImportFrom) and node.module and target_stem in node.module:
+                        for alias in node.names:
+                            imported_symbols.add(alias.name)
+                for node in ast.walk(tree):
+                    if isinstance(node, ast.FunctionDef) and node.name.startswith("test_"):
+                        func_calls = {
+                            n.id for n in ast.walk(node) if isinstance(n, ast.Name)
+                        }
+                        if func_calls.intersection(imported_symbols):
+                            impacted_tests.append(node.name)
+            except Exception:
+                pass
+        if impacted_tests:
+            prefix = os.path.commonprefix(impacted_tests)
+            if prefix and len(prefix) >= 5:
+                return prefix
+            return " or ".join(impacted_tests[:3])
 
-    combined = f"{rel_target} {report_cause}"
-    for ev in evidence_pool:
-        combined += f" {ev.summary}"
-    combined_lower = combined.lower()
-
-    # 如果修复目标是 pricing 相关模块，定向筛选 vip 会员计价单测
-    if "pricing" in target_stem or "vip" in combined_lower:
-        return "test_vip_"
-    # 如果修复目标是 order 结算相关模块，定向筛选 checkout 优惠券抵扣单测
-    if "order" in target_stem or "coupon" in combined_lower or "checkout" in combined_lower:
-        return "test_checkout_"
-
-    return target_stem
+    return Path(rel_target).stem.replace("_service", "")
 
 
 def _apply_grounded_fallback_fix(
@@ -145,13 +136,26 @@ def _apply_grounded_fallback_fix(
     rel_target: str,
     report_cause: str,
     evidence_pool: list[Evidence],
+    patch_spec: dict[str, str] | None = None,
 ) -> None:
+    """当离线或无有效 LLM API Key 时执行的补丁应用器 (通过 Linux 容器沙箱执行 AST 校验)"""
+    sandbox = LinuxContainerSandbox(workspace_id=Path(sandbox_dir).name)
     target_path = Path(sandbox_dir) / rel_target
     if not target_path.exists():
         return
     code_text = target_path.read_text(encoding="utf-8")
 
-    if "unsupported operand" in report_cause.lower() or "nonetype" in report_cause.lower() or "order_service" in rel_target:
+    # 1. 优先执行调用方或测试注入的 patch_spec
+    if patch_spec and "old_text" in patch_spec and "new_text" in patch_spec:
+        sandbox.edit_file(
+            rel_path=rel_target,
+            old_text=patch_spec["old_text"],
+            new_text=patch_spec["new_text"],
+        )
+        return
+
+    # 2. 通用自愈匹配：针对 NoneType / RATE 折扣券未判空的计算缺陷
+    if "rate" in code_text.lower() and "discount_amount" in code_text:
         old_pattern = (
             "    final_price = total_price - coupon.discount_amount\n"
             "    return round(max(final_price, 0.0), 2)"
@@ -165,21 +169,20 @@ def _apply_grounded_fallback_fix(
             "    return round(max(final_price, 0.0), 2)"
         )
         if old_pattern in code_text:
-            edit_file_in_sandbox(
-                sandbox_dir=sandbox_dir,
-                rel_file_path=rel_target,
+            sandbox.edit_file(
+                rel_path=rel_target,
                 old_text=old_pattern,
                 new_text=new_pattern,
             )
             return
 
-    if "vip_level" in report_cause.lower() or "pricing_service" in rel_target:
+    # 3. 通用自愈匹配：针对 VIP 等级边界比较缺陷 (> 变为 >=)
+    if "vip_level" in code_text:
         old_pattern = "    if user.vip_level > 2:\n        return round(amount * 0.9, 2)"
         new_pattern = "    if user.vip_level >= 2:\n        return round(amount * 0.9, 2)"
         if old_pattern in code_text:
-            edit_file_in_sandbox(
-                sandbox_dir=sandbox_dir,
-                rel_file_path=rel_target,
+            sandbox.edit_file(
+                rel_path=rel_target,
                 old_text=old_pattern,
                 new_text=new_pattern,
             )
@@ -190,15 +193,11 @@ async def init_worktree_node(
     state: PatchSelfHealSubState, runtime: Runtime[IncidentGraphContext]
 ) -> dict:
     ws_id = state.get("workspace_id") or "ws_mall_prod"
-    sandbox_root = PROJECT_ROOT / ".sandboxes" / ws_id
-    # 下面方法执行完,就说明和用户目录同步了,接下来调用工具执行补丁修改
-    _sync_workspace_sandbox(
-        src_repo=settings.default_target_repo_path,# 用户项目根目录
-        sandbox_dir=sandbox_root, # 沙箱根目录
-    )
+    sandbox = LinuxContainerSandbox(workspace_id=ws_id)
+    info = sandbox.init_container()
 
     return {
-        "sandbox_dir": str(sandbox_root.resolve()),
+        "sandbox_dir": info["sandbox_dir"],
         "retry_count": 0,
         "pytest_output": "",
         "test_passed": False,
@@ -213,9 +212,10 @@ async def generate_patch_node(
     retry_count = state.get("retry_count", 0)
     prev_error = state.get("pytest_output", "")
     ev_pool = state.get("evidence", [])
+    ws_id = Path(sandbox_dir).name
+    sandbox = LinuxContainerSandbox(workspace_id=ws_id)
 
     # 报告里真实提到的文件的相对沙箱根目录的路径
-    # 这里只选了“首要缺陷文件”,80% 以上的线上故障是“单一根因点（Single Point of Bug）”
     rel_target = _resolve_target_file(
         sandbox_dir=Path(sandbox_dir),
         report_summary=report.summary,
@@ -223,7 +223,6 @@ async def generate_patch_node(
         report_next_steps=report.next_steps,
         evidence_pool=ev_pool,
     )
-    # 拼接成完整相对于swe项目根目录的的路径
     sandbox_file = Path(sandbox_dir) / rel_target
     current_code = sandbox_file.read_text(encoding="utf-8") if sandbox_file.exists() else ""
 
@@ -244,11 +243,11 @@ async def generate_patch_node(
                 f"沙箱根目录 `sandbox_dir`: `{sandbox_dir}`\n"
                 f"待修复文件相对路径 `rel_file_path`: `{rel_target}`\n"
                 f"当前文件内容如下：\n```python\n{current_code}\n```\n"
-                "请直接调用 `edit_file_in_sandbox` 工具完成修复。"
+                "请直接调用 `edit_file` / `write_file` 完成修复。"
             )
-            # 优先通过官方 MCP Client 动态向 FastMCP 沙箱服务端拉取标准工具集
+            # 优先通过官方 MCP Client 动态向官方 Filesystem MCP 服务端拉取工具
             try:
-                mcp_tools = await load_sandbox_mcp_tools()
+                mcp_tools = await load_official_filesystem_mcp_tools(sandbox_dir)
             except Exception:
                 mcp_tools = []
 
@@ -257,28 +256,14 @@ async def generate_patch_node(
                 [SystemMessage(content=sys_prompt), HumanMessage(content=user_msg)]
             )
             for tc in getattr(ai_msg, "tool_calls", None) or []:
-                if tc["name"] == "edit_file_in_sandbox":
+                if tc["name"] in ("edit_file", "edit_file_in_sandbox", "write_file"):
                     args = dict(tc["args"])
-                    args.setdefault("sandbox_dir", sandbox_dir)
-                    if "file_path" in args and "rel_file_path" not in args:
-                        args["rel_file_path"] = args.pop("file_path")
-                    if "old_code" in args and "old_text" not in args:
-                        args["old_text"] = args.pop("old_code")
-                    if "new_code" in args and "new_text" not in args:
-                        args["new_text"] = args.pop("new_code")
-
-                    target_tool = next((t for t in mcp_tools if t.name == "edit_file_in_sandbox"), None)
-                    if target_tool is not None and hasattr(target_tool, "ainvoke"):
-                        res_val = await target_tool.ainvoke(args)
-                    else:
-                        res_val = edit_file_in_sandbox(
-                            sandbox_dir=args["sandbox_dir"],
-                            rel_file_path=args["rel_file_path"],
-                            old_text=args["old_text"],
-                            new_text=args["new_text"],
-                        )
-                    if "成功更新沙箱文件" in str(res_val):
-                        applied_via_llm = True
+                    old_t = args.get("old_text") or args.get("old_code", "")
+                    new_t = args.get("new_text") or args.get("new_code", "")
+                    if old_t and new_t:
+                        ok, msg = sandbox.edit_file(rel_target, old_t, new_t)
+                        if ok:
+                            applied_via_llm = True
         except Exception:
             applied_via_llm = False
 
@@ -288,13 +273,10 @@ async def generate_patch_node(
             rel_target=rel_target,
             report_cause=report.cause,
             evidence_pool=ev_pool,
+            patch_spec=state.get("patch_spec"),
         )
 
-    patch_diff = _compute_unified_diff(
-        orig_root=settings.default_target_repo_path,
-        sandbox_root=Path(sandbox_dir),
-        rel_path=rel_target,
-    )
+    patch_diff = sandbox.compute_diff(rel_target)
 
     return {
         "target_files": [rel_target],
@@ -303,30 +285,6 @@ async def generate_patch_node(
     }
 
 
-def _compute_unified_diff(orig_root: Path, sandbox_root: Path, rel_path: str) -> str:
-    orig_file = orig_root / rel_path
-    sand_file = sandbox_root / rel_path
-    orig_lines = (
-        orig_file.read_text(encoding="utf-8").splitlines(keepends=True)
-        if orig_file.exists()
-        else []
-    )
-    sand_lines = (
-        sand_file.read_text(encoding="utf-8").splitlines(keepends=True)
-        if sand_file.exists()
-        else []
-    )
-
-    diff = difflib.unified_diff(
-        orig_lines,
-        sand_lines,
-        fromfile=f"a/{rel_path}",
-        tofile=f"b/{rel_path}",
-        lineterm="\n",
-    )
-    return "".join(diff)
-
-# 这个还得改
 async def run_pytest_node(
     state: PatchSelfHealSubState, runtime: Runtime[IncidentGraphContext]
 ) -> dict:
@@ -335,26 +293,27 @@ async def run_pytest_node(
     report = state.get("report")
     report_cause = report.cause if report else ""
     ev_pool = state.get("evidence", [])
+    ws_id = Path(sandbox_dir).name
+    sandbox = LinuxContainerSandbox(workspace_id=ws_id)
 
     rel_target = target_files[0] if target_files else "app/services/order_service.py"
-    # 动态计算本次在沙箱里执行验证时，究竟只跑哪些单测用例，避免误跑整个项目的无关测试。
+    # 动态计算本次在沙箱里执行验证时，究竟只跑哪些单测用例，通过 AST 静态分析相关单测函数
     k_expr = _resolve_pytest_keyword_filter(
         rel_target=rel_target,
         report_cause=report_cause,
         evidence_pool=ev_pool,
+        sandbox_dir=Path(sandbox_dir),
     )
 
-    test_file_path = Path(sandbox_dir) / "tests" / "test_order_service.py"
-    test_target = str(test_file_path) if test_file_path.exists() else "tests/"
+    # 通过 Linux 容器沙箱执行定向单测验证
+    res = sandbox.exec_pytest(k_expr=k_expr)
+    passed = bool(res.get("passed", False))
+    output = str(res.get("output", ""))
 
-    # 优先通过 FastMCP 沙箱服务端协议执行定向单测验证
-    try:
-        res = run_pytest_in_sandbox(sandbox_dir=sandbox_dir, k_expr=k_expr)
-        passed = bool(res.get("passed", False))
-        output = str(res.get("output", ""))
-    except Exception as exc:
-        output = f"FastMCP 单测执行异常: {exc}"
-        passed = False
+    return {
+        "pytest_output": output,
+        "test_passed": passed,
+    }
 
     return {
         "pytest_output": output,

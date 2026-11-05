@@ -11,6 +11,7 @@ class TriageClues(BaseModel):
     api_path: str = Field(default="", description="涉及的接口路由路径，如 /api/orders/checkout")
     error_keyword: str = Field(default="", description="报错关键词或异常类名，如 TypeError, 500")
     module_hint: str = Field(default="", description="推测相关的业务模块名，如 order, pricing, sms")
+    trace_id: str = Field(default="", description="涉及的全链路追踪编号，如 tr-88910-a1")
     title: str = Field(default="故障排查会话", description="15字以内的排障会话简短标题")
 
 

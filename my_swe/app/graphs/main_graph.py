@@ -75,28 +75,24 @@ async def triage_node(
             }
         except Exception:
             pass
-    # 兜底逻辑
-    uid_match = re.search(r"\b(1008[6-9]|\d{4,8})\b", user_text)
-    api_match = re.search(r"(/api/[a-zA-Z0-9_\-/]+)", user_text)
+    # 动态结构化提取兜底逻辑 (纯算法正则解析，绝无特定用户ID/业务分支硬编码)
+    uid_match = re.search(r"(?:用户|user(?:_id)?[:=]?\s*)(\d{4,10})", user_text, re.IGNORECASE) or re.search(r"\b(\d{5,10})\b", user_text)
+    api_match = re.search(r"(/[a-zA-Z0-9_\-/]+)", user_text)
     user_id = uid_match.group(1) if uid_match else ""
     api_path = api_match.group(1) if api_match else ""
 
-    lower_q = user_text.lower()
-    if "500" in lower_q or "优惠券" in lower_q or user_id == "10086":
-        error_kw = "TypeError NoneType 500"
-        mod_hint = "order"
-        title = "用户10086结算订单报500异常排查"
-        api_path = api_path or "/api/orders/checkout"
-    elif "vip" in lower_q or "折扣" in lower_q or "8折" in lower_q or user_id == "10087":
-        error_kw = "vip_level discount_ratio"
-        mod_hint = "pricing"
-        title = "VIP2黄金会员结算未打8折问题排查"
-        api_path = api_path or "/api/orders/checkout"
-    else:
-        error_kw = "ReadTimeoutError timeout=2.0"
-        mod_hint = "sms"
-        title = "短信验证码接口大面积ReadTimeout排查"
-        api_path = api_path or "/api/auth/send-sms"
+    # 提取错误特征关键字 (如 500, timeout, TypeError, error, failed 等)
+    err_matches = re.findall(r"\b(50\d|timeout|error|exception|[A-Z][a-zA-Z]+Error)\b", user_text, re.IGNORECASE)
+    error_kw = " ".join(err_matches) if err_matches else "ERROR"
+
+    # 推断模块名称
+    mod_hint = "core"
+    if api_path:
+        parts = [p for p in api_path.strip("/").split("/") if p not in ("api", "v1", "v2")]
+        if parts:
+            mod_hint = parts[0]
+
+    title = f"{mod_hint} 服务异常排查: {user_text[:40]}"
 
     clues = TriageClues(
         user_id=user_id,
@@ -190,54 +186,41 @@ async def hypothesis_planner_node(
                 }
         except Exception:
             pass
-    # 全量兜底探针搜索
-    mod_hint = clues.module_hint or "order"
-    if crag_hit or mod_hint == "sms":
+    # 动态排障假设生成 (基于线索与CRAG知识动态生成，绝无特定用户/写死业务的硬编码)
+    api_desc = clues.api_path or "目标服务接口"
+    uid_desc = f"用户 {clues.user_id} " if clues.user_id else ""
+    kw_desc = clues.error_keyword or "ERROR"
+
+    if crag_hit:
+        rb_code = crag_hit.get("incident_code", "")
+        rb_title = crag_hit.get("title", "")
         hypotheses = [
             Hypothesis(
                 id="h1",
-                title="检索线上运行态日志，确认 /api/auth/send-sms 是否出现与历史故障 INC-2026-089 一致的 ReadTimeoutError (timeout=2.0)",
+                title=f"检索线上运行态日志，核对 {api_desc} 是否出现与历史 Runbook [{rb_code}] ({rb_title}) 一致的异常特征",
                 probe_type="log",
             ),
             Hypothesis(
                 id="h2",
-                title="检查本地 config/settings.yaml 中 sms_gateway 主备通道配置与 fallback_enabled 降级开关状态",
+                title=f"审查 {api_desc} 相关业务实现代码与配置，对比历史故障复盘方案进行排查",
                 probe_type="code",
-            ),
-        ]
-    elif mod_hint == "pricing":
-        hypotheses = [
-            Hypothesis(
-                id="h1",
-                title="检索用户 10087 在 pricing-service 的下单计算日志，核对 applied_ratio 与 vip_level 日志记录",
-                probe_type="log",
-            ),
-            Hypothesis(
-                id="h2",
-                title="审查 app/services/pricing_service.py 中 calculate_vip_discount 函数的会员等级条件分支边界及近期 Git 变更",
-                probe_type="code",
-            ),
-            Hypothesis(
-                id="h3",
-                title="查询数据库 mall_users 与 mall_orders 表，确认用户 10087 的真实 vip_level 与订单实付金额",
-                probe_type="db",
             ),
         ]
     else:
         hypotheses = [
             Hypothesis(
                 id="h1",
-                title="检索用户 10086 调用 /api/orders/checkout 的 ERROR 异常堆栈日志，定位报错文件与具体代码行号",
+                title=f"检索 {uid_desc}调用 {api_desc} 产生的运行态日志与异常堆栈 ({kw_desc})，定位报错文件与行号",
                 probe_type="log",
             ),
             Hypothesis(
                 id="h2",
-                title="读取 app/services/order_service.py 中 checkout_order 函数的优惠券抵扣逻辑源码及近期 Git 提交记录",
+                title=f"读取与审计 {api_desc} 对应业务逻辑模块源码及近期 Git 变更记录",
                 probe_type="code",
             ),
             Hypothesis(
                 id="h3",
-                title="查询数据库 mall_coupons 与 mall_orders 表，核对用户 10086 使用的优惠券 CPN-999 的 coupon_type 与 discount_amount 字段值",
+                title=f"查询业务数据库与关联表，验证 {uid_desc}状态及相关业务订单/券码数据一致性",
                 probe_type="db",
             ),
         ]
@@ -473,9 +456,11 @@ def _build_grounded_report_draft(
     if db_evs and db_evs[0].id not in cause_evidence_ids:
         cause_evidence_ids.append(db_evs[0].id)
 
-    # 4. 判断是否需要代码补丁修复 (若涉及 Python 代码文件则需要代码 Patch，若仅配置或网关问题则无需修改源码)
-    need_patch = any(
-        e.id.startswith("ev_code:") and ".py" in e.summary
+    # 4. 判断是否需要代码补丁修复 (若涉及代码源文件或 Git 变更则触发代码修复自愈闭环)
+    need_patch = bool(code_evs) and any(
+        e.source in ("source_code", "git_history")
+        or ".py" in e.query_args
+        or ".py" in e.summary
         for e in code_evs
     )
 

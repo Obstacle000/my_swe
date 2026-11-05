@@ -8,12 +8,15 @@
 """
 
 import asyncio
+import re
+import shutil
 from typing import Any
+import pytest
 from langchain_core.messages import HumanMessage
 from langgraph.types import Command
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-from app.config import settings
+from app.config import PROJECT_ROOT, settings
 from app.core.evidence_collector import build_evidence, redact_text
 from app.core.report_verifier import verify_and_finalize_report
 from app.graphs.context import IncidentGraphContext
@@ -27,6 +30,22 @@ from app.repositories.mysql.runbook_repo import RunbookRepository
 from app.schemas.incident_schemas import Claim, ReportDraft
 from app.services.knowledge_service import INITIAL_RUNBOOKS
 from app.services.range_service import INITIAL_RUNTIME_LOGS
+
+
+@pytest.fixture(autouse=True)
+def preserve_target_repo_state():
+    """测试前后自动快照并回滚靶场源码状态，清除沙箱目录，确保测试之间完全环境隔离"""
+    svc_dir = settings.default_target_repo_path / "app/services"
+    snapshots = {}
+    if svc_dir.exists():
+        for py_file in svc_dir.glob("*.py"):
+            snapshots[py_file] = py_file.read_text(encoding="utf-8")
+    try:
+        yield
+    finally:
+        for py_file, content in snapshots.items():
+            py_file.write_text(content, encoding="utf-8")
+        shutil.rmtree(PROJECT_ROOT / ".sandboxes", ignore_errors=True)
 
 
 class _DummyEmbedding:
@@ -230,12 +249,7 @@ def test_full_langgraph_workflow_with_injected_context_and_hitl_resume():
 
         await engine.dispose()
 
-    order_svc_path = settings.default_target_repo_path / "app/services/order_service.py"
-    orig_code = order_svc_path.read_text(encoding="utf-8")
-    try:
-        asyncio.run(_run())
-    finally:
-        order_svc_path.write_text(orig_code, encoding="utf-8")
+    asyncio.run(_run())
 
 
 def test_fastapi_routers_with_annotated_deps_and_service_injection():

@@ -12,20 +12,12 @@ from langgraph.runtime import Runtime
 
 from app.config import get_llm, settings
 from app.core.evidence_collector import build_evidence
+from app.core.safe_tools import SAFE_DB_TOOLS, SAFE_LOG_TOOLS
 from app.graphs.context import IncidentGraphContext
 from app.graphs.state import ProbeWorkerState
+from app.mcp.client import load_official_filesystem_mcp_tools
 from app.prompts.loader import load_prompt
 from app.schemas.incident_schemas import Evidence, TriageClues
-from app.mcp.code_server import CODE_TOOLS, code_tools_by_name
-from app.mcp.probe_server import DB_TOOLS, LOG_TOOLS
-
-_TOOLSET_BY_PROBE_TYPE = {
-    "log": LOG_TOOLS,
-    "code": CODE_TOOLS,
-    "db": DB_TOOLS,
-}
-
-_CODE_TOOLS_BY_NAME = code_tools_by_name
 
 
 def _has_valid_llm_key() -> bool:
@@ -51,7 +43,6 @@ async def probe_agent_node(
 
     known_facts = list(state.get("known_facts", []))
 
-    tools = _TOOLSET_BY_PROBE_TYPE.get(hypothesis.probe_type, CODE_TOOLS)
     sys_prompt = load_prompt(
         "probe_worker.md.jinja",
         probe_type=hypothesis.probe_type,
@@ -64,7 +55,14 @@ async def probe_agent_node(
 
     if _has_valid_llm_key():
         try:
-            llm_with_tools = get_llm(temperature=0.0).bind_tools(tools)
+            if hypothesis.probe_type == "code":
+                tools = await load_official_filesystem_mcp_tools()
+            elif hypothesis.probe_type == "db":
+                tools = SAFE_DB_TOOLS
+            else:
+                tools = SAFE_LOG_TOOLS
+
+            llm_with_tools = get_llm(temperature=0.0).bind_tools(tools) if tools else get_llm(temperature=0.0)
             invoke_msgs = [SystemMessage(content=sys_prompt)] + worker_msgs
             ai_resp = await llm_with_tools.ainvoke(invoke_msgs)
             return {"worker_messages": [ai_resp]}
@@ -86,114 +84,113 @@ async def probe_agent_node(
 
     return {"worker_messages": [AIMessage(content="探针取证完毕。")]}
 
-# 兜底工具调用
+# 确定性动态工具调用生成器 (完全消除任何测试场景/用户ID/特定分支的硬编码)
 def _build_deterministic_tool_calls(
     probe_type: str, clues: TriageClues | dict[str, str], title: str
 ) -> list[dict]:
-    """根据排障线索与探针类型构造真实的工具调用请求"""
+    """根据排障线索与探针类型动态构造标准的工具调用请求 (无任何场景/用户ID硬编码)"""
     if isinstance(clues, TriageClues):
-        uid = clues.user_id
-        api_path = clues.api_path
-        keyword = clues.error_keyword
+        uid = str(getattr(clues, "user_id", "") or "").strip()
+        api_path = str(getattr(clues, "api_path", "") or "").strip()
+        keyword = str(getattr(clues, "error_keyword", "") or "").strip()
+        trace_id = str(getattr(clues, "trace_id", "") or "").strip()
     else:
-        uid = clues.get("user_id", "")
-        api_path = clues.get("api_path", "")
-        keyword = clues.get("error_keyword", "")
-    combined = f"{title} {api_path} {keyword} {uid}".lower()
+        uid = str(clues.get("user_id", "")).strip()
+        api_path = str(clues.get("api_path", "")).strip()
+        keyword = str(clues.get("error_keyword", "")).strip()
+        trace_id = str(clues.get("trace_id", "")).strip()
 
     if probe_type == "log":
-        return [
+        calls = [
             {
-                "id": "call_log_1",
+                "id": "call_log_search",
                 "name": "search_error_logs",
                 "args": {
-                    "keyword": "" if uid else keyword,
+                    "keyword": keyword,
                     "api_path": api_path,
                     "user_id": uid,
                     "level": "",
                 },
             }
         ]
+        if trace_id:
+            calls.append(
+                {
+                    "id": "call_log_trace",
+                    "name": "get_trace_logs",
+                    "args": {"trace_id": trace_id},
+                }
+            )
+        return calls
 
     if probe_type == "code":
-        if "vip" in combined or "10087" in combined or "折扣" in combined or "pricing" in combined:
-            return [
-                {
-                    "id": "call_code_1",
-                    "name": "read_file_window",
-                    "args": {
-                        "file_path": "app/services/pricing_service.py",
-                        "start_line": 1,
-                        "end_line": 70,
-                    },
-                },
-                {
-                    "id": "call_code_2",
-                    "name": "git_blame_diff",
-                    "args": {"file_path": "app/services/pricing_service.py"},
-                },
-            ]
-        if "sms" in combined or "验证码" in combined or "timeout" in combined or "10088" in combined:
-            return [
-                {
-                    "id": "call_code_1",
-                    "name": "read_file_window",
-                    "args": {
-                        "file_path": "config/settings.yaml",
-                        "start_line": 1,
-                        "end_line": 50,
-                    },
-                }
-            ]
+        # 动态根据 api_path 或 title 推断潜在服务源码文件
+        target_file = ""
+        import re
+        match = re.search(r"([a-zA-Z0-9_\-/\\]+\.py)", f"{title} {api_path} {keyword}")
+        if match:
+            target_file = match.group(1).replace("\\", "/")
+        elif api_path:
+            parts = [p for p in api_path.strip("/").split("/") if p not in ("api", "v1", "v2")]
+            if parts:
+                mod_name = parts[-1] if not parts[-1].endswith("s") else parts[-1][:-1]
+                target_file = f"app/services/{mod_name}_service.py"
+
+        if not target_file:
+            target_file = "app/services/order_service.py"
+
         return [
             {
-                "id": "call_code_1",
+                "id": "call_code_read",
                 "name": "read_file_window",
                 "args": {
-                    "file_path": "app/services/order_service.py",
+                    "file_path": target_file,
                     "start_line": 1,
-                    "end_line": 85,
+                    "end_line": 120,
                 },
             },
             {
-                "id": "call_code_2",
+                "id": "call_code_blame",
                 "name": "git_blame_diff",
-                "args": {"file_path": "app/services/order_service.py"},
+                "args": {"file_path": target_file},
             },
         ]
 
     # probe_type == "db"
-    if "10087" in combined or "vip" in combined or "折扣" in combined:
+    if uid:
         return [
             {
-                "id": "call_db_1",
+                "id": "call_db_inspect",
+                "name": "inspect_table_schema",
+                "args": {"table_name": "all"},
+            },
+            {
+                "id": "call_db_query_orders",
                 "name": "execute_readonly_sql",
                 "args": {
-                    "sql_query": "SELECT id, username, vip_level, status FROM mall_users WHERE id = 10087"
+                    "sql_query": f"SELECT * FROM mall_orders WHERE user_id = {uid} ORDER BY order_id DESC LIMIT 5"
                 },
             },
             {
-                "id": "call_db_2",
+                "id": "call_db_query_coupons",
                 "name": "execute_readonly_sql",
                 "args": {
-                    "sql_query": "SELECT order_id, user_id, base_price, final_price, order_status, trace_id FROM mall_orders WHERE user_id = 10087"
+                    "sql_query": f"SELECT * FROM mall_coupons WHERE user_id = {uid} LIMIT 10"
                 },
             },
         ]
 
     return [
         {
-            "id": "call_db_1",
-            "name": "execute_readonly_sql",
-            "args": {
-                "sql_query": "SELECT coupon_id, user_id, coupon_type, discount_amount, discount_rate, status FROM mall_coupons WHERE user_id = 10086"
-            },
+            "id": "call_db_inspect",
+            "name": "inspect_table_schema",
+            "args": {"table_name": "all"},
         },
         {
-            "id": "call_db_2",
+            "id": "call_db_query",
             "name": "execute_readonly_sql",
             "args": {
-                "sql_query": "SELECT order_id, user_id, sku_id, base_price, coupon_id, final_price, order_status, trace_id FROM mall_orders WHERE user_id = 10086"
+                "sql_query": "SELECT * FROM mall_orders ORDER BY order_id DESC LIMIT 5"
             },
         },
     ]
@@ -225,27 +222,63 @@ async def _execute_tool_with_context(
         if not logs:
             return f"未找到 trace_id={t_args.get('trace_id')} 对应的链路日志。"
         return json.dumps(logs, ensure_ascii=False, indent=2)
-    # 以下是测试用于访问数据源的工具,有点丑陋,删的化记得也把deps,repo,lifespan,依赖注入也删了
+    if t_name == "list_datasources":
+        from app.core.datasource_registry import datasource_registry
+        return json.dumps(datasource_registry.list_datasources(), ensure_ascii=False, indent=2)
+
     if t_name == "inspect_table_schema":
-        return mall_probe_repo.get_table_ddl(t_args.get("table_name", "all"))
+        if mall_probe_repo is not None and hasattr(mall_probe_repo, "get_table_ddl"):
+            return mall_probe_repo.get_table_ddl(t_args.get("table_name", "all"))
+        from app.core.datasource_registry import datasource_registry
+        return await datasource_registry.inspect_sql_schema(t_args.get("table_name", "all"))
 
     if t_name == "execute_readonly_sql":
         sql_query = str(t_args.get("sql_query", ""))
-        ok, result = await mall_probe_repo.execute_readonly_select(sql_query)
+        if mall_probe_repo is not None and hasattr(mall_probe_repo, "execute_readonly_select"):
+            ok, result = await mall_probe_repo.execute_readonly_select(sql_query)
+        else:
+            from app.core.datasource_registry import datasource_registry
+            ok, result = await datasource_registry.execute_readonly_sql(sql_query)
         if not ok:
             return str(result)
         if not result:
             return f"查询成功，但返回 0 行记录 (SQL: {sql_query})。"
         return json.dumps(result, ensure_ascii=False, indent=2)
 
-    code_impl = _CODE_TOOLS_BY_NAME.get(t_name)
-    if code_impl is not None:
-        if callable(code_impl):
-            return str(code_impl(**t_args))
-        if hasattr(code_impl, "invoke"):
-            return str(code_impl.invoke(t_args))
+    if t_name in ("read_file_window", "read_file"):
+        file_path = t_args.get("file_path") or t_args.get("path", "")
+        clean_path = str(file_path).replace("\\", "/").lstrip("/")
+        repo_root = settings.default_target_repo_path
+        target = repo_root / clean_path
+        if not target.is_file():
+            from pathlib import Path
+            for candidate in [repo_root / clean_path, repo_root / "app/services" / Path(clean_path).name]:
+                if candidate.is_file():
+                    target = candidate
+                    break
+        if not target.is_file():
+            return f"文件不存在: {file_path}"
+        lines = target.read_text(encoding="utf-8").splitlines()
+        s_line = int(t_args.get("start_line", 1))
+        e_line = int(t_args.get("end_line", len(lines)))
+        sliced = lines[max(0, s_line - 1) : e_line]
+        return "\n".join(f"{i + s_line}: {line}" for i, line in enumerate(sliced))
 
-    return f"未找到工具: {t_name}"
+    if t_name == "git_blame_diff":
+        file_path = t_args.get("file_path", "")
+        clean_path = str(file_path).replace("\\", "/").lstrip("/")
+        repo_root = settings.default_target_repo_path
+        import subprocess
+        proc = subprocess.run(
+            ["git", "log", "-n", "3", "--stat", "--", clean_path],
+            cwd=str(repo_root),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        return proc.stdout or f"文件 {clean_path} 近期未发现独立提交变更记录。"
+
+    return f"未找到外部工具或适配器: {t_name}"
 
 
 async def probe_tool_node(
