@@ -13,6 +13,7 @@ from langchain_core.messages import HumanMessage
 from langgraph.types import Command
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
+from app.config import settings
 from app.core.evidence_collector import build_evidence, redact_text
 from app.core.report_verifier import verify_and_finalize_report
 from app.graphs.context import IncidentGraphContext
@@ -223,9 +224,18 @@ def test_full_langgraph_workflow_with_injected_context_and_hitl_resume():
             codes = {r.incident_code for r in all_runbooks}
             assert "INC-AUTO-ASE1" in codes
 
+            # 3. 验证沙箱中的补丁已被真正合入目标业务系统 target_mall_app
+            order_svc_path = settings.default_target_repo_path / "app/services/order_service.py"
+            assert 'coupon.coupon_type == "RATE"' in order_svc_path.read_text(encoding="utf-8")
+
         await engine.dispose()
 
-    asyncio.run(_run())
+    order_svc_path = settings.default_target_repo_path / "app/services/order_service.py"
+    orig_code = order_svc_path.read_text(encoding="utf-8")
+    try:
+        asyncio.run(_run())
+    finally:
+        order_svc_path.write_text(orig_code, encoding="utf-8")
 
 
 def test_fastapi_routers_with_annotated_deps_and_service_injection():

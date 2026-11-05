@@ -4,7 +4,10 @@
 """
 
 import json
+import os
 import re
+import shutil
+from pathlib import Path
 from typing import Literal
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langgraph.checkpoint.memory import MemorySaver
@@ -12,7 +15,7 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.runtime import Runtime
 from langgraph.types import Send, interrupt
 
-from app.config import get_llm, settings
+from app.config import PROJECT_ROOT, get_llm, settings
 from app.core.report_verifier import verify_and_finalize_report
 from app.graphs.context import IncidentGraphContext
 from app.graphs.crag_subgraph import crag_subgraph
@@ -692,8 +695,52 @@ def _route_after_approval(
     return "apply_and_evolve_node"
 
 
+def _merge_sandbox_patch_to_target_repo(
+    sandbox_dir: Path,
+    target_repo: Path,
+    patch_diff: str = "",
+) -> list[str]:
+    """人工审批通过后，将沙箱中已通过验证的代码补丁安全合入目标业务项目（源仓库）。"""
+    merged_files: list[str] = []
+    if not sandbox_dir.exists() or not target_repo.exists():
+        return merged_files
+
+    # 1. 优先从 patch_diff 中提取修改的文件相对路径
+    rel_files: list[str] = []
+    if patch_diff:
+        for line in patch_diff.splitlines():
+            if line.startswith("--- a/") or line.startswith("+++ b/"):
+                rel = line[6:].strip()
+                if rel and rel not in rel_files:
+                    rel_files.append(rel)
+
+    # 2. 将沙箱中验证通过的文件写入目标仓库
+    for rel in rel_files:
+        src = sandbox_dir / rel
+        dst = target_repo / rel
+        if src.is_file():
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dst)
+            merged_files.append(rel.replace("\\", "/"))
+
+    # 3. 兜底扫描：若 diff 未解析出路径，比对沙箱与目标仓库中的差异文件
+    if not merged_files:
+        for root, dirs, files in os.walk(sandbox_dir):
+            dirs[:] = [d for d in dirs if d not in ("__pycache__", ".pytest_cache", ".venv", ".git")]
+            for f in files:
+                if f.endswith(".py"):
+                    sand_f = Path(root) / f
+                    rel = os.path.relpath(sand_f, sandbox_dir)
+                    orig_f = target_repo / rel
+                    if orig_f.exists() and sand_f.read_bytes() != orig_f.read_bytes():
+                        shutil.copy2(sand_f, orig_f)
+                        merged_files.append(rel.replace("\\", "/"))
+
+    return merged_files
+
+
 # ============================================================================
-# 节点 10: apply_and_evolve_node (通过 runtime.context 中的仓储写入 MySQL -> ES -> Qdrant)
+# 节点 10: apply_and_evolve_node (通过 runtime.context 中的仓储写入 MySQL -> ES -> Qdrant，并合入主仓库)
 # ============================================================================
 async def apply_and_evolve_node(
     state: IncidentMainState, runtime: Runtime[IncidentGraphContext]
@@ -706,13 +753,27 @@ async def apply_and_evolve_node(
 
     if approval == "rejected":
         reject_msg = AIMessage(
-            content=f"本次排障会话 (`{inc_id}`) 的处置建议已被人工驳回，未写入历史故障知识库。"
+            content=f"本次排障会话 (`{inc_id}`) 的处置建议已被人工驳回，未合入主项目亦未写入历史知识库。"
         )
         return {"messages": [reject_msg]}
 
+    # 1. 人工审批通过且沙箱单测通过：将沙箱代码补丁真正写回目标业务主项目 (target_mall_app)
+    merged_files: list[str] = []
+    if approval == "approved" and state.get("test_passed"):
+        ws_id = state.get("workspace_id") or "ws_mall_prod"
+        sandbox_dir = PROJECT_ROOT / ".sandboxes" / ws_id
+        target_repo = settings.default_target_repo_path
+        patch_diff = state.get("patch_diff", "")
+        merged_files = _merge_sandbox_patch_to_target_repo(
+            sandbox_dir=sandbox_dir,
+            target_repo=target_repo,
+            patch_diff=patch_diff,
+        )
+
+    # 2. 沉淀排障 SOP 到知识库
     if report is not None:
         new_code = f"INC-AUTO-{inc_id[-4:].upper()}"
-        # 1. 先存 MySQL 关系库 historical_runbooks 主表 (Source of Truth)
+        # 先存 MySQL 关系库 historical_runbooks 主表 (Source of Truth)
         rb_model = await ctx["runbook_repo"].create_if_not_exists(
             incident_code=new_code,
             title=clues.title or report.summary[:40],
@@ -731,9 +792,9 @@ async def apply_and_evolve_node(
             "service_name": rb_model.service_name,
             "error_keywords": rb_model.error_keywords,
         }
-        # 2. 同步写入 ES BM25 索引
+        # 同步写入 ES BM25 索引
         await ctx["runbook_es_repo"].index_runbook(runbook_doc)
-        # 3. 同步向量化并写入 Qdrant 向量集合
+        # 同步向量化并写入 Qdrant 向量集合
         embed_text = (
             f"故障标题: {runbook_doc['title']}\n"
             f"故障现象: {runbook_doc['symptoms']}\n"
@@ -743,10 +804,16 @@ async def apply_and_evolve_node(
         vector = await ctx["embedding"].aembed_query(embed_text)
         await ctx["runbook_qdrant_repo"].upsert_runbook(vector=vector, payload=runbook_doc)
 
+    merge_status_desc = (
+        f"已成功将沙箱自愈补丁合入业务主项目 (`{', '.join(merged_files)}`)"
+        if merged_files
+        else "无需合入代码补丁（配置变更或排障审计报告）"
+    )
     summary_msg = AIMessage(
         content=(
             f"本次排障会话 (`{inc_id}`) 已完成人工审批并结案归档。\n"
             f"- 报告 SHA-256 指纹: `{report.digest if report else ''}`\n"
+            f"- 补丁合并状态: {merge_status_desc}。\n"
             f"- 经验自进化状态: 已将本次根因与解决方案同步写入 MySQL、ES 与 Qdrant 历史故障知识库。"
         )
     )

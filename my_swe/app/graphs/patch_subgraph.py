@@ -24,23 +24,30 @@ def _has_valid_llm_key() -> bool:
 
 
 def _sync_workspace_sandbox(src_repo: Path, sandbox_dir: Path) -> None:
+    # 首次进入（冷启动）：全量克隆
     if not sandbox_dir.exists():
+        # 创建sandbox_dir的父级目录,即.sandboxes
         sandbox_dir.parent.mkdir(parents=True, exist_ok=True)
         shutil.copytree(src_repo, sandbox_dir)
         return
-
+    # os.walk 默认会一直深度递归遍历下去，直到把所有的子目录、孙子目录全部遍历
     for root, dirs, files in os.walk(src_repo):
+        # root：当前正在访问的目录绝对路径
         dirs[:] = [d for d in dirs if d not in ("__pycache__", ".pytest_cache", ".venv", ".git")]
+        # os.path.relpath(path, start):计算某个路径（path）相对于基准路径（start）的相对路径（Relative Path）。
         rel_dir = os.path.relpath(root, src_repo)
+        # "."意味着当前目录就是用户根目录,创建sandbox_dir,但是sandbox_dir以创建所以跳过
+        # 只创建,用户根目录里面的目录
         target_dir = sandbox_dir if rel_dir == "." else sandbox_dir / rel_dir
         target_dir.mkdir(parents=True, exist_ok=True)
 
+        # 遍历当前目录文件拷贝到目标目录下面
         for f in files:
             if f.endswith(".pyc") or f.endswith(".log"):
                 continue
             src_file = Path(root) / f
             dst_file = target_dir / f
-
+            # 只同步修改过和缺失的的文件
             if not dst_file.exists() or src_file.read_bytes() != dst_file.read_bytes():
                 shutil.copy2(src_file, dst_file)
 
@@ -61,7 +68,7 @@ def _normalize_rel_path(cand: str, sandbox_dir: Path) -> str | None:
             return rel.replace("\\", "/")
     return None
 
-
+# 返回的是相对sandbox_dir的路径
 def _resolve_target_file(
     sandbox_dir: Path,
     report_summary: str,
@@ -78,6 +85,7 @@ def _resolve_target_file(
     # 1. 优先提取排障报告明确指出的根因模块与处置步骤
     report_text = f"{report_cause} {' '.join(report_next_steps)} {report_summary}"
     for match in re.findall(r"([a-zA-Z0-9_\-/\\]+\.py)", report_text):
+        # 把大模型、堆栈日志或探针报告里提到的“五花八门的乱七八糟路径”，规范化映射成沙箱里真正存在的相对路径（如 app/services/order_service.py）
         resolved = _normalize_rel_path(match, sandbox_dir)
         if resolved:
             return resolved
@@ -106,7 +114,7 @@ def _resolve_target_file(
                 rel = os.path.relpath(os.path.join(root, f), sandbox_dir)
                 return rel.replace("\\", "/")
 
-    return "app/services/order_service.py"
+    return "app/services/order_service.py" # 兜底相对路径
 
 
 def _resolve_pytest_keyword_filter(
@@ -182,10 +190,10 @@ async def init_worktree_node(
 ) -> dict:
     ws_id = state.get("workspace_id") or "ws_mall_prod"
     sandbox_root = PROJECT_ROOT / ".sandboxes" / ws_id
-
+    # 下面方法执行完,就说明和用户目录同步了,接下来调用工具执行补丁修改
     _sync_workspace_sandbox(
-        src_repo=settings.default_target_repo_path,
-        sandbox_dir=sandbox_root,
+        src_repo=settings.default_target_repo_path,# 用户项目根目录
+        sandbox_dir=sandbox_root, # 沙箱根目录
     )
 
     return {
@@ -205,6 +213,8 @@ async def generate_patch_node(
     prev_error = state.get("pytest_output", "")
     ev_pool = state.get("evidence", [])
 
+    # 报告里真实提到的文件的相对沙箱根目录的路径
+    # 这里只选了“首要缺陷文件”,80% 以上的线上故障是“单一根因点（Single Point of Bug）”
     rel_target = _resolve_target_file(
         sandbox_dir=Path(sandbox_dir),
         report_summary=report.summary,
@@ -212,7 +222,7 @@ async def generate_patch_node(
         report_next_steps=report.next_steps,
         evidence_pool=ev_pool,
     )
-
+    # 拼接成完整相对于swe项目根目录的的路径
     sandbox_file = Path(sandbox_dir) / rel_target
     current_code = sandbox_file.read_text(encoding="utf-8") if sandbox_file.exists() else ""
 
@@ -299,7 +309,7 @@ def _compute_unified_diff(orig_root: Path, sandbox_root: Path, rel_path: str) ->
     )
     return "".join(diff)
 
-
+# 这个还得改
 async def run_pytest_node(
     state: PatchSelfHealSubState, runtime: Runtime[IncidentGraphContext]
 ) -> dict:
@@ -310,6 +320,7 @@ async def run_pytest_node(
     ev_pool = state.get("evidence", [])
 
     rel_target = target_files[0] if target_files else "app/services/order_service.py"
+    # 动态计算本次在沙箱里执行验证时，究竟只跑哪些单测用例，避免误跑整个项目的无关测试。
     k_expr = _resolve_pytest_keyword_filter(
         rel_target=rel_target,
         report_cause=report_cause,

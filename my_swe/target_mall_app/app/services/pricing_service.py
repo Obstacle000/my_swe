@@ -37,7 +37,7 @@ def calc_vip_discount(user: UserRecord, amount: float) -> float:
     # 业务规则要求黄金会员 (vip_level == 2) 及以上享受 9 折，
     # 但此处误写成了 `>` 2，导致黄金会员掉入下方分支未能享受 9 折，且不抛任何异常！
     # -----------------------------------------------------------------
-    if user.vip_level > 2:
+    if user.vip_level >= 2:
         return round(amount * 0.9, 2)
     if user.vip_level == 1:
         return round(amount * 0.95, 2)
