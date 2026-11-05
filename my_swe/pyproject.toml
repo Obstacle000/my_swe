@@ -25,5 +25,5 @@ dependencies = [
 ]
 
 [tool.pytest.ini_options]
-testpaths = ["target_mall_app/tests"]
+testpaths = ["tests"]
 pythonpath = ["."]

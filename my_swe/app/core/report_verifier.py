@@ -109,6 +109,7 @@ def verify_and_finalize_report(
     # 校验每个被标记为 supported 的假设是否绑定了真实证据
     cleaned_hypotheses: list[Hypothesis] = []
     for h in draft.hypotheses:
+        # 假说里真实存在于全局状态中的evidences
         real_h_refs = valid_refs(h.evidence_ids, valid_ids)
         if h.assessment == "supported" and not real_h_refs:
             all_violations.append(

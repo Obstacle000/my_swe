@@ -6,3 +6,5 @@
 6. 工具权限与安全沙箱控制 (Tool Guardrails & Read/Write Separation)
 7. CI/CD 与真实发布流水线对接 (GitOps / Webhook 回环)
 8. 知识库/Runbook 的动态外置 (从硬编码初始化 -> 真实运维文档系统对接)
+9. git tree沙箱
+10. PROJECT_ROOT智能识别

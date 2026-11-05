@@ -10,6 +10,7 @@ from app.schemas.incident_schemas import (
     Hypothesis,
     IncidentReport,
     ReportDraft,
+    TriageClues,
 )
 
 
@@ -20,7 +21,7 @@ class IncidentMainState(TypedDict):
     incident_id: str
     workspace_id: str
     user_query: NotRequired[str]                                   # 用户的原始提问
-    extracted_clues: NotRequired[dict[str, str]]                   # 提炼出的 user_id, trace_id, api_path 等
+    extracted_clues: NotRequired[TriageClues]                      # 提炼出的结构化线索 (TriageClues Schema 对象)
     messages: Annotated[list[AnyMessage], add_messages]            # 主图消息历史
 
     # 2. CRAG 历史故障检索子图回传的结果
@@ -70,7 +71,7 @@ class ProbeWorkerState(TypedDict):
     """子图二：单假设探针验证子图私有状态 (由 Send API 并行派生)"""
 
     hypothesis: Hypothesis
-    clues: dict[str, str]
+    clues: TriageClues
     known_facts: NotRequired[list[str]]                            # 主图已查明的现场确凿事实/前序证据摘要（只读情报下发）
     worker_messages: Annotated[list[AnyMessage], add_messages]     # 子图私有工具调用对话过程，不污染主图
     remaining_chars: int                                           # 当前探针的字符预算上限 (15000)
@@ -83,6 +84,7 @@ class PatchSelfHealSubState(TypedDict):
     """子图三：沙箱代码修复与单测自愈子图私有状态"""
 
     incident_id: str
+    workspace_id: NotRequired[str]                                 # 对应所属靶场工作区 (用于沙箱目录复用与增量基线同步)
     report: IncidentReport
     evidence: list[Evidence]
     sandbox_dir: NotRequired[str]

@@ -12,7 +12,7 @@ class IncidentMainState(TypedDict):
     incident_id: str
     target_project_id: str                                   # 排查目标工作区 ID
     user_query: str                                          # 用户的原始提问
-    extracted_clues: dict[str, str]                          # 提炼出的 user_id, trace_id, url 等
+    extracted_clues: TriageClues                             # 提炼出的结构化线索对象 (user_id, api_path 等)
     messages: Annotated[list[AnyMessage], add_messages]      # 主图消息历史
 
     # 2. 排障核心数据与证据流

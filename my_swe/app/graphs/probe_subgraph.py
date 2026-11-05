@@ -15,7 +15,7 @@ from app.core.evidence_collector import build_evidence
 from app.graphs.context import IncidentGraphContext
 from app.graphs.state import ProbeWorkerState
 from app.prompts.loader import load_prompt
-from app.schemas.incident_schemas import Evidence
+from app.schemas.incident_schemas import Evidence, TriageClues
 from app.tools.code_tools import CODE_TOOLS
 from app.tools.db_tools import DB_TOOLS
 from app.tools.log_tools import LOG_TOOLS
@@ -42,7 +42,7 @@ async def probe_agent_node(
 ) -> dict:
     """探针推理节点：根据假设类型挂载隔离工具集并决定调用哪个探针工具"""
     hypothesis = state["hypothesis"]
-    clues = state.get("clues", {})
+    clues = state.get("clues") or TriageClues()
     remaining = state.get("remaining_chars", 15000)
     worker_msgs = list(state.get("worker_messages", []))
 
@@ -58,7 +58,7 @@ async def probe_agent_node(
         probe_type=hypothesis.probe_type,
         hypothesis_id=hypothesis.id,
         hypothesis_title=hypothesis.title,
-        clues_text=json.dumps(clues, ensure_ascii=False),
+        clues_text=clues.model_dump_json() if hasattr(clues, "model_dump_json") else json.dumps(clues, ensure_ascii=False),
         remaining_chars=remaining,
         known_facts=known_facts,
     )
@@ -89,12 +89,17 @@ async def probe_agent_node(
 
 # 兜底工具调用
 def _build_deterministic_tool_calls(
-    probe_type: str, clues: dict[str, str], title: str
+    probe_type: str, clues: TriageClues | dict[str, str], title: str
 ) -> list[dict]:
     """根据排障线索与探针类型构造真实的工具调用请求"""
-    uid = clues.get("user_id", "")
-    api_path = clues.get("api_path", "")
-    keyword = clues.get("error_keyword", "")
+    if isinstance(clues, TriageClues):
+        uid = clues.user_id
+        api_path = clues.api_path
+        keyword = clues.error_keyword
+    else:
+        uid = clues.get("user_id", "")
+        api_path = clues.get("api_path", "")
+        keyword = clues.get("error_keyword", "")
     combined = f"{title} {api_path} {keyword} {uid}".lower()
 
     if probe_type == "log":
@@ -278,6 +283,7 @@ async def probe_tool_node(
             continue
 
         try:
+            # 调用工具
             raw_out = await _execute_tool_with_context(t_name, t_args, ctx)
         except Exception as exc:
             raw_out = f"工具调用异常 ({t_name}): {exc}"

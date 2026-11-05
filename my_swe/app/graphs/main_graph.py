@@ -66,7 +66,7 @@ async def triage_node(
                 [SystemMessage(content=sys_prompt), HumanMessage(content=user_text)]
             )
             return {
-                "extracted_clues": clues_obj.model_dump(),
+                "extracted_clues": clues_obj,
                 "loop_count": 0,
                 "verify_retry_count": 0,
             }
@@ -103,7 +103,7 @@ async def triage_node(
         title=title[:15],
     )
     return {
-        "extracted_clues": clues.model_dump(),
+        "extracted_clues": clues,
         "loop_count": 0,
         "verify_retry_count": 0,
     }
@@ -115,10 +115,10 @@ async def triage_node(
 async def crag_subgraph_node(
     state: IncidentMainState, runtime: Runtime[IncidentGraphContext]
 ) -> dict:
-    clues = state.get("extracted_clues", {})
+    clues = state.get("extracted_clues") or TriageClues()
     user_text = _latest_user_query(state)
     combined_query = (
-        f"{user_text} {clues.get('api_path', '')} {clues.get('error_keyword', '')}".strip()
+        f"{user_text} {clues.api_path} {clues.error_keyword}".strip()
     )
 
     sub_res = await crag_subgraph.ainvoke(
@@ -144,7 +144,7 @@ async def crag_subgraph_node(
 async def hypothesis_planner_node(
     state: IncidentMainState, runtime: Runtime[IncidentGraphContext]
 ) -> dict:
-    clues = state.get("extracted_clues", {})
+    clues = state.get("extracted_clues") or TriageClues()
     hist_ctx = state.get("historical_context", "")
     crag_hit = state.get("crag_hit", False)
     loop_count = state.get("loop_count", 0)
@@ -156,7 +156,7 @@ async def hypothesis_planner_node(
             sys_prompt = load_prompt("planner.md")
             # crag_hit 为false 那么historical_context一定不存在,true一定存在,可能是兜底发力了
             user_ctx = (
-                f"【分诊提取线索】：{json.dumps(clues, ensure_ascii=False)}\n"
+                f"【分诊提取线索】：{clues.model_dump_json()}\n"
                 f"【CRAG 历史故障检索结果 (crag_hit={crag_hit})】：\n{hist_ctx}\n"
             )
             # 注入前序所有探针已查明的确凿证据事实账本 (Evidence Ledger)
@@ -183,12 +183,12 @@ async def hypothesis_planner_node(
                 return {
                     "hypotheses": plan.hypotheses,
                     "loop_count": loop_count + 1,
-                    "evaluate_retry_reason": "",
+                    "evaluate_retry_reason": "",# 重置上一轮的重试理由
                 }
         except Exception:
             pass
     # 全量兜底探针搜索
-    mod_hint = clues.get("module_hint", "order")
+    mod_hint = clues.module_hint or "order"
     if crag_hit or mod_hint == "sms":
         hypotheses = [
             Hypothesis(
@@ -246,7 +246,7 @@ async def hypothesis_planner_node(
 # 条件分发边: 使用 LangGraph Send API 并行派生多个 ProbeWorkerSubgraph
 # ============================================================================
 def _dispatch_probe_workers(state: IncidentMainState) -> list[Send]:
-    clues = state.get("extracted_clues", {})
+    clues = state.get("extracted_clues") or TriageClues()
     ev_pool = _dedup_evidences(state.get("evidence", []))
     # 提炼出已知的情报事实摘要下发给并行探针 (Known Facts)
     known_facts = [
@@ -292,7 +292,7 @@ async def evidence_evaluate_node(
 ) -> dict:
     """审查并行探针汇总的真实证据池，判定是否足以锁定确凿根因；若不足则生成 evaluate_retry_reason"""
     ev_list = _dedup_evidences(state.get("evidence", []))
-    clues = state.get("extracted_clues", {})
+    clues = state.get("extracted_clues") or TriageClues()
     hypotheses = state.get("hypotheses", [])
     valid_ev_ids = {ev.id for ev in ev_list}
 
@@ -304,7 +304,7 @@ async def evidence_evaluate_node(
                 for ev in ev_list
             )
             user_prompt = (
-                f"【排障线索】：{json.dumps(clues, ensure_ascii=False)}\n\n"
+                f"【排障线索】：{clues.model_dump_json()}\n\n"
                 f"【当前待验证假设列表】：{json.dumps([h.model_dump() for h in hypotheses], ensure_ascii=False)}\n\n"
                 f"【当前真实证据池 (State.evidence)】：\n{ev_summary_text}\n"
             )
@@ -317,6 +317,7 @@ async def evidence_evaluate_node(
             clean_hypotheses: list[Hypothesis] = []
             for h in eval_res.updated_hypotheses:
                 filtered_ids = [eid for eid in h.evidence_ids if eid in valid_ev_ids]
+                # 基于现有对象创建一个副本，并在副本中替换或添加指定的字段值。
                 clean_hypotheses.append(h.model_copy(update={"evidence_ids": filtered_ids}))
 
             # 若证据不足以锁定根因，生成结构化的打回重试批注；证据充足则置空
@@ -373,7 +374,7 @@ def _route_after_evaluate(
 async def generate_report_node(
     state: IncidentMainState, runtime: Runtime[IncidentGraphContext]
 ) -> dict:
-    clues = state.get("extracted_clues", {})
+    clues = state.get("extracted_clues") or TriageClues()
     ev_pool = _dedup_evidences(state.get("evidence", []))
     hypotheses = state.get("hypotheses", [])
     verify_err = state.get("verification_error", "")
@@ -386,7 +387,7 @@ async def generate_report_node(
                 for ev in ev_pool
             )
             user_prompt = (
-                f"【排障线索】：{json.dumps(clues, ensure_ascii=False)}\n\n"
+                f"【排障线索】：{clues.model_dump_json()}\n\n"
                 f"【待验证假设列表】：{json.dumps([h.model_dump() for h in hypotheses], ensure_ascii=False)}\n\n"
                 f"【当前真实证据池 (State.evidence) —— 严禁引用此列表之外的证据ID】：\n{ev_summary_text}\n"
             )
@@ -417,7 +418,7 @@ def _dedup_evidences(ev_list: list[Evidence]) -> list[Evidence]:
 
 
 def _build_grounded_report_draft(
-    clues: dict[str, str],
+    clues: TriageClues,
     hypotheses: list[Hypothesis],
     ev_pool: list[Evidence],
 ) -> ReportDraft:
@@ -450,8 +451,8 @@ def _build_grounded_report_draft(
     if log_evs:
         problem_text = f"运行态异常堆栈记录：{log_evs[0].summary}"
     else:
-        api = clues.get("api_path", "业务服务")
-        kw = clues.get("error_keyword", "异常")
+        api = clues.api_path or "业务服务"
+        kw = clues.error_keyword or "异常"
         problem_text = f"系统监测到 {api} 接口异常 ({kw})，导致用户请求处理失败。"
 
     # 3. 动态提取根因事实
@@ -463,7 +464,7 @@ def _build_grounded_report_draft(
         cause_text = f"数据库业务记录异常：{db_evs[0].summary}"
         cause_evidence_ids.extend([e.id for e in db_evs[:2]])
     else:
-        cause_text = f"经探针排查，异常与 {clues.get('module_hint', '核心')} 模块外部依赖或配置相关。"
+        cause_text = f"经探针排查，异常与 {clues.module_hint or '核心'} 模块外部依赖或配置相关。"
         cause_evidence_ids.extend(all_ids[:2])
 
     if db_evs and db_evs[0].id not in cause_evidence_ids:
@@ -496,7 +497,7 @@ def _build_grounded_report_draft(
     )
 
     impact_claim = Claim(
-        text=f"影响 {clues.get('module_hint', '业务')} 模块相关用户业务请求及后续链路正常流转。",
+        text=f"影响 {clues.module_hint or '业务'} 模块相关用户业务请求及后续链路正常流转。",
         evidence_ids=(log_ids + db_ids)[:3] or all_ids[:2],
     )
     cause_claim = Claim(
@@ -573,6 +574,9 @@ async def verify_report_node(
                 "（保留报告中的 [证据引用: ev_xxx] 标记，不要编造任何报告之外的信息）：\n\n"
                 f"{fallback_markdown}"
             )
+            # 不管是ainvoke还是astream都睡产生token,靠的是一个特殊的 流式回调处理器（AsyncCallbackHandler)
+            # 模型每吐出一个 token，底层 client 就会触发回调方法 on_llm_new_token(token)。
+            # LangGraph 的回调监听器会立刻把这个 token 打包成一个 AIMessageChunk,对外暴露出来
             ai_resp = await summary_llm.ainvoke([HumanMessage(content=summary_prompt)])
             if ai_resp and ai_resp.content:
                 assistant_reply = AIMessage(content=str(ai_resp.content))
@@ -596,7 +600,7 @@ def _route_after_verify(
     if final_report is None:
         if state.get("verify_retry_count", 0) < 2:
             return "generate_report_node"
-        clues = state.get("extracted_clues", {})
+        clues = state.get("extracted_clues") or TriageClues()
         ev_pool = _dedup_evidences(state.get("evidence", []))
         fallback_draft = _build_grounded_report_draft(
             clues, state.get("hypotheses", []), ev_pool
@@ -622,10 +626,12 @@ async def patch_subgraph_node(
     report = state["final_report"]
     ev_pool = _dedup_evidences(state.get("evidence", []))
     inc_id = state.get("incident_id", "inc_default")
+    ws_id = state.get("workspace_id") or "ws_mall_prod"
 
     patch_res = await patch_subgraph.ainvoke(
         PatchSelfHealSubState(
             incident_id=inc_id,
+            workspace_id=ws_id,
             report=report,
             evidence=ev_pool,
             test_passed=False,
@@ -694,7 +700,7 @@ async def apply_and_evolve_node(
 ) -> dict:
     ctx = runtime.context
     report = state.get("final_report")
-    clues = state.get("extracted_clues", {})
+    clues = state.get("extracted_clues") or TriageClues()
     inc_id = state.get("incident_id", "inc_default")
     approval = state.get("human_approval", "approved")
 
@@ -709,12 +715,12 @@ async def apply_and_evolve_node(
         # 1. 先存 MySQL 关系库 historical_runbooks 主表 (Source of Truth)
         rb_model = await ctx["runbook_repo"].create_if_not_exists(
             incident_code=new_code,
-            title=clues.get("title", report.summary[:40]),
+            title=clues.title or report.summary[:40],
             symptoms=report.problem,
             root_cause=report.cause,
             resolution="\n".join(report.next_steps),
-            service_name=f"{clues.get('module_hint', 'core')}-service",
-            error_keywords=f"{clues.get('error_keyword', '')} {clues.get('api_path', '')}".strip(),
+            service_name=f"{clues.module_hint or 'core'}-service",
+            error_keywords=f"{clues.error_keyword} {clues.api_path}".strip(),
         )
         runbook_doc = {
             "incident_code": rb_model.incident_code,
