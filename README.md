@@ -1,4 +1,6 @@
 # My-SWE：基于 LangGraph 的企业级多源故障根因定位与代码自愈系统
+![Uploading langgraph_architecture.png…]()
+
 
 本项目为《基于 LangGraph 的企业级多源故障根因分析（RCA）与代码自愈平台》的完整工程实现，对齐体系化设计规格与工业级排障规范：
 
