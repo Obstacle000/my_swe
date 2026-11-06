@@ -26,7 +26,7 @@ class TriggerFaultRequest(BaseModel):
 class CreateIncidentRequest(BaseModel):
     """新建排障会话请求体"""
 
-    workspace_id: str = Field(default="ws_mall_prod", description="所属工作空间ID")
+    workspace_id: str = Field(default="", description="所属业务工作空间命名，如 mall_prod, crm_prod (未填则默认读取配置文件)")
     trigger_source: Literal["user_chat", "alert_webhook", "range_inject"] = Field(
         default="user_chat", description="排障触发来源"
     )

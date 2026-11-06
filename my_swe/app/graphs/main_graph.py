@@ -614,7 +614,7 @@ async def patch_subgraph_node(
     report = state["final_report"]
     ev_pool = _dedup_evidences(state.get("evidence", []))
     inc_id = state.get("incident_id", "inc_default")
-    ws_id = state.get("workspace_id") or "ws_mall_prod"
+    ws_id = state.get("workspace_id") or "ws_default_prod"
 
     patch_res = await patch_subgraph.ainvoke(
         PatchSelfHealSubState(
@@ -742,10 +742,10 @@ async def apply_and_evolve_node(
         )
         return {"messages": [reject_msg]}
 
-    # 1. 人工审批通过且沙箱单测通过：将沙箱代码补丁真正写回目标业务主项目 (target_mall_app)
+    # 1. 人工审批通过且沙箱单测通过：将沙箱代码补丁真正写回目标业务主项目 (settings.default_target_repo_path)
     merged_files: list[str] = []
     if approval == "approved" and state.get("test_passed"):
-        ws_id = state.get("workspace_id") or "ws_mall_prod"
+        ws_id = state.get("workspace_id") or "ws_default_prod"
         sandbox_dir = PROJECT_ROOT / ".sandboxes" / ws_id
         target_repo = settings.default_target_repo_path
         patch_diff = state.get("patch_diff", "")

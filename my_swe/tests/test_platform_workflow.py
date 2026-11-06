@@ -196,7 +196,6 @@ def test_full_langgraph_workflow_with_injected_context_and_hitl_resume():
                 embedding=_DummyEmbedding(),  # type: ignore[typeddict-item]
                 incident_repo=incident_repo,
                 runbook_repo=runbook_repo,
-                mall_probe_repo=mall_probe_repo,
                 runtime_log_es_repo=_FakeRuntimeLogESRepo(),  # type: ignore[typeddict-item]
                 runbook_es_repo=_FakeRunbookESRepo(),  # type: ignore[typeddict-item]
                 runbook_qdrant_repo=_FakeRunbookQdrantRepo(),  # type: ignore[typeddict-item]

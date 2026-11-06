@@ -32,7 +32,7 @@ class _SettingsCompat:
 
     @property
     def default_target_repo_path(self):
-        return PROJECT_ROOT / "target_mall_app"
+        return app_config.target_project.resolved_path
 
 
 settings = _SettingsCompat()

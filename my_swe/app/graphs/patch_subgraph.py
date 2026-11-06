@@ -29,8 +29,9 @@ def _has_valid_llm_key() -> bool:
 
 def _normalize_rel_path(cand: str, sandbox_dir: Path) -> str | None:
     cleaned = cand.replace("\\", "/").strip().lstrip("/")
-    if cleaned.startswith("target_mall_app/"):
-        cleaned = cleaned[len("target_mall_app/") :]
+    target_root_name = f"{settings.default_target_repo_path.name}/"
+    if cleaned.startswith(target_root_name):
+        cleaned = cleaned[len(target_root_name) :]
 
     for prefix in ["", "app/services/", "app/api/", "app/"]:
         if not prefix:
@@ -192,7 +193,7 @@ def _apply_grounded_fallback_fix(
 async def init_worktree_node(
     state: PatchSelfHealSubState, runtime: Runtime[IncidentGraphContext]
 ) -> dict:
-    ws_id = state.get("workspace_id") or "ws_mall_prod"
+    ws_id = state.get("workspace_id") or "ws_default_prod"
     sandbox = LinuxContainerSandbox(workspace_id=ws_id)
     info = sandbox.init_container()
 
@@ -223,6 +224,7 @@ async def generate_patch_node(
         report_next_steps=report.next_steps,
         evidence_pool=ev_pool,
     )
+    # 只要一个文件,一般根因都只出在一个文件
     sandbox_file = Path(sandbox_dir) / rel_target
     current_code = sandbox_file.read_text(encoding="utf-8") if sandbox_file.exists() else ""
 

@@ -29,7 +29,7 @@ async def create_incident_endpoint(
 @router.get("", response_model=ApiResponse)
 async def list_incidents_endpoint(
     service: IncidentServiceDep,
-    workspace_id: str = "ws_mall_prod",
+    workspace_id: str = "",
 ) -> ApiResponse:
     """查询指定工作空间下的排障会话列表"""
     data = await service.list_incidents(workspace_id=workspace_id)

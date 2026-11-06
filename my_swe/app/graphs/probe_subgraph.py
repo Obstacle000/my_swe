@@ -1,18 +1,19 @@
 """子图二：单假设探针验证子图 (ProbeWorkerSubgraph)
-通过 Runtime[IncidentGraphContext] 从运行上下文中获取注入的：
+通过 Runtime[IncidentGraphContext] 与 DatasourceRegistry 执行：
 - runtime_log_es_repo (ES 运行态日志仓储)
-- mall_probe_repo (MySQL 电商靶场只读探针仓储)
+- datasource_registry (企业级多数据源通用只读与反射网关)
 """
 
 import json
 from typing import Literal
 from langchain_core.messages import AIMessage, SystemMessage, ToolMessage
+from langchain_core.tools import BaseTool
 from langgraph.graph import END, START, StateGraph
 from langgraph.runtime import Runtime
 
 from app.config import get_llm, settings
 from app.core.evidence_collector import build_evidence
-from app.core.safe_tools import SAFE_DB_TOOLS, SAFE_LOG_TOOLS
+from app.core.safe_tools import SAFE_CODE_TOOLS, SAFE_DB_TOOLS, SAFE_LOG_TOOLS
 from app.graphs.context import IncidentGraphContext
 from app.graphs.state import ProbeWorkerState
 from app.mcp.client import load_official_filesystem_mcp_tools
@@ -56,7 +57,11 @@ async def probe_agent_node(
     if _has_valid_llm_key():
         try:
             if hypothesis.probe_type == "code":
-                tools = await load_official_filesystem_mcp_tools()
+                tools = list(SAFE_CODE_TOOLS)
+                try:
+                    tools.extend(await load_official_filesystem_mcp_tools())
+                except Exception:
+                    pass
             elif hypothesis.probe_type == "db":
                 tools = SAFE_DB_TOOLS
             else:
@@ -84,7 +89,7 @@ async def probe_agent_node(
 
     return {"worker_messages": [AIMessage(content="探针取证完毕。")]}
 
-# 确定性动态工具调用生成器 (完全消除任何测试场景/用户ID/特定分支的硬编码)
+# 确定性动态工具调用生成器
 def _build_deterministic_tool_calls(
     probe_type: str, clues: TriageClues | dict[str, str], title: str
 ) -> list[dict]:
@@ -124,17 +129,46 @@ def _build_deterministic_tool_calls(
         return calls
 
     if probe_type == "code":
-        # 动态根据 api_path 或 title 推断潜在服务源码文件
+        # 动态根据 api_path、title 与目标工程目录结构推断服务源码文件
         target_file = ""
         import re
+        from pathlib import Path
+        repo_root = settings.default_target_repo_path
+
         match = re.search(r"([a-zA-Z0-9_\-/\\]+\.py)", f"{title} {api_path} {keyword}")
         if match:
-            target_file = match.group(1).replace("\\", "/")
-        elif api_path:
+            cand = match.group(1).replace("\\", "/")
+            if (repo_root / cand).exists():
+                target_file = cand
+
+        if not target_file and api_path:
             parts = [p for p in api_path.strip("/").split("/") if p not in ("api", "v1", "v2")]
-            if parts:
-                mod_name = parts[-1] if not parts[-1].endswith("s") else parts[-1][:-1]
+            # 优先在目标工程中寻找匹配的 service 源码文件
+            for p in parts:
+                stem = p[:-1] if p.endswith("s") else p
+                candidates = [
+                    f"app/services/{stem}_service.py",
+                    f"app/services/{p}_service.py",
+                    f"services/{stem}_service.py",
+                    f"{stem}_service.py",
+                ]
+                for cand in candidates:
+                    if (repo_root / cand).is_file():
+                        target_file = cand
+                        break
+                if target_file:
+                    break
+
+            if not target_file and parts:
+                mod_name = parts[0][:-1] if parts[0].endswith("s") else parts[0]
                 target_file = f"app/services/{mod_name}_service.py"
+
+        if not target_file:
+            svc_dir = repo_root / "app" / "services"
+            if svc_dir.is_dir():
+                py_files = [f for f in svc_dir.glob("*.py") if not f.name.startswith("__")]
+                if py_files:
+                    target_file = f"app/services/{py_files[0].name}"
 
         if not target_file:
             target_file = "app/services/order_service.py"
@@ -157,43 +191,89 @@ def _build_deterministic_tool_calls(
         ]
 
     # probe_type == "db"
-    if uid:
-        return [
-            {
-                "id": "call_db_inspect",
-                "name": "inspect_table_schema",
-                "args": {"table_name": "all"},
-            },
-            {
-                "id": "call_db_query_orders",
-                "name": "execute_readonly_sql",
-                "args": {
-                    "sql_query": f"SELECT * FROM mall_orders WHERE user_id = {uid} ORDER BY order_id DESC LIMIT 5"
-                },
-            },
-            {
-                "id": "call_db_query_coupons",
-                "name": "execute_readonly_sql",
-                "args": {
-                    "sql_query": f"SELECT * FROM mall_coupons WHERE user_id = {uid} LIMIT 10"
-                },
-            },
-        ]
+    from app.conf.app_config import app_config
 
-    return [
+    # 1. 动态推断项目数据表前缀 (根据 target_project 路径动态提取，如 target_xxx_app -> xxx_，绝无写死业务前缀)
+    proj_name = getattr(app_config.target_project.path, "name", str(app_config.target_project.path))
+    proj_prefix = ""
+    if proj_name.startswith("target_"):
+        cleaned_proj = proj_name[len("target_") :]
+        if cleaned_proj.endswith("_app"):
+            cleaned_proj = cleaned_proj[:-len("_app")]
+        proj_prefix = f"{cleaned_proj}_"
+
+    # 2. 动态推断主实体与关联实体 (从 api_path / title / clues 提取)
+    table_candidates: list[str] = []
+    if api_path:
+        parts = [p for p in api_path.strip("/").split("/") if p not in ("api", "v1", "v2", "v3")]
+        if parts:
+            table_candidates.append(parts[0])
+            if len(parts) > 1 and parts[1] not in ("checkout", "detail", "list", "query", "create", "update", "verify"):
+                table_candidates.append(parts[1])
+
+    if not table_candidates:
+        mod = getattr(clues, "module_hint", "") if isinstance(clues, TriageClues) else clues.get("module_hint", "")
+        if mod and mod != "core":
+            table_candidates.append(mod)
+
+    import re
+    # 尝试从 title / keyword 中提取提及的表名或实体词
+    matches = re.findall(r"(?:from|join|table)\s+([a-zA-Z0-9_]+)", f"{title} {keyword}", re.IGNORECASE)
+    for m in matches:
+        if m.lower() not in table_candidates:
+            table_candidates.append(m.lower())
+
+    # 常见关联实体推断 (根据线索文本中包含的关键字)
+    for kw in ("coupon", "discount", "user", "account", "ticket", "item", "payment"):
+        if kw in f"{title} {keyword}".lower() and f"{kw}s" not in table_candidates:
+            table_candidates.append(f"{kw}s")
+
+    if not table_candidates:
+        table_candidates = ["orders", "records"]
+
+    main_table = f"{proj_prefix}{table_candidates[0]}"
+
+    calls = [
         {
             "id": "call_db_inspect",
             "name": "inspect_table_schema",
             "args": {"table_name": "all"},
-        },
-        {
-            "id": "call_db_query",
-            "name": "execute_readonly_sql",
-            "args": {
-                "sql_query": "SELECT * FROM mall_orders ORDER BY order_id DESC LIMIT 5"
-            },
-        },
+        }
     ]
+
+    if uid:
+        calls.append(
+            {
+                "id": "call_db_query_main",
+                "name": "execute_readonly_sql",
+                "args": {
+                    "sql_query": f"SELECT * FROM {main_table} WHERE user_id = {uid} LIMIT 5"
+                },
+            }
+        )
+        if len(table_candidates) > 1:
+            sec_table = f"{proj_prefix}{table_candidates[1]}"
+            calls.append(
+                {
+                    "id": "call_db_query_sec",
+                    "name": "execute_readonly_sql",
+                    "args": {
+                        "sql_query": f"SELECT * FROM {sec_table} WHERE user_id = {uid} LIMIT 10"
+                    },
+                }
+            )
+    else:
+        calls.append(
+            {
+                "id": "call_db_query_main",
+                "name": "execute_readonly_sql",
+                "args": {
+                    "sql_query": f"SELECT * FROM {main_table} LIMIT 5"
+                },
+            }
+        )
+
+    return calls
 
 
 async def _execute_tool_with_context(
@@ -201,84 +281,50 @@ async def _execute_tool_with_context(
     t_args: dict,
     ctx: IncidentGraphContext,
 ) -> str:
-    """使用 runtime.context 中注入的 Repository 实例执行对应的探针查询"""
-    log_es_repo = ctx["runtime_log_es_repo"]
-    mall_probe_repo = ctx["mall_probe_repo"]
-    # 有的工具需要额外的参数,模型不知道只能手动传入
-    if t_name == "search_error_logs":
-        hits = await log_es_repo.search_logs(
-            keyword=t_args.get("keyword", ""),
-            api_path=t_args.get("api_path", ""),
-            user_id=str(t_args.get("user_id", "")),
-            level=t_args.get("level", ""),
-            limit=5,
-        )
-        if not hits:
-            return "未检索到匹配的运行态日志，请尝试放宽过滤条件。"
-        return json.dumps(hits, ensure_ascii=False, indent=2)
+    """动态工具执行分发网关：直接通过 safe_tools 注册表与外部 MCP 动态分发"""
+    from app.core.safe_tools import (
+        SAFE_CODE_TOOLS,
+        SAFE_DB_TOOLS,
+        SAFE_LOG_TOOLS,
+        current_runtime_log_es_repo,
+    )
 
-    if t_name == "get_trace_logs":
-        logs = await log_es_repo.get_logs_by_trace_id(str(t_args.get("trace_id", "")))
-        if not logs:
-            return f"未找到 trace_id={t_args.get('trace_id')} 对应的链路日志。"
-        return json.dumps(logs, ensure_ascii=False, indent=2)
-    if t_name == "list_datasources":
-        from app.core.datasource_registry import datasource_registry
-        return json.dumps(datasource_registry.list_datasources(), ensure_ascii=False, indent=2)
+    # 1. 直接复用 safe_tools 现成工具列表构建动态索引
+    tool_map: dict[str, BaseTool] = {
+        t.name: t for t in (SAFE_DB_TOOLS + SAFE_LOG_TOOLS + SAFE_CODE_TOOLS)
+    }
 
-    if t_name == "inspect_table_schema":
-        if mall_probe_repo is not None and hasattr(mall_probe_repo, "get_table_ddl"):
-            return mall_probe_repo.get_table_ddl(t_args.get("table_name", "all"))
-        from app.core.datasource_registry import datasource_registry
-        return await datasource_registry.inspect_sql_schema(t_args.get("table_name", "all"))
+    # 2. 动态合并外部标准 MCP 工具
+    try:
+        from app.mcp.client import load_official_filesystem_mcp_tools
+        for mt in await load_official_filesystem_mcp_tools():
+            tool_map.setdefault(mt.name, mt)
+    except Exception:
+        pass
 
-    if t_name == "execute_readonly_sql":
-        sql_query = str(t_args.get("sql_query", ""))
-        if mall_probe_repo is not None and hasattr(mall_probe_repo, "execute_readonly_select"):
-            ok, result = await mall_probe_repo.execute_readonly_select(sql_query)
-        else:
-            from app.core.datasource_registry import datasource_registry
-            ok, result = await datasource_registry.execute_readonly_sql(sql_query)
-        if not ok:
-            return str(result)
-        if not result:
-            return f"查询成功，但返回 0 行记录 (SQL: {sql_query})。"
-        return json.dumps(result, ensure_ascii=False, indent=2)
+    # 参数别名与路径兼容规整 (例如 official MCP 的 read_file(path=...) 兼容适配)
+    if t_name == "read_file" and "file_path" not in t_args and "path" in t_args:
+        t_args = {
+            "file_path": t_args["path"],
+            "start_line": int(t_args.get("start_line", 1)),
+            "end_line": int(t_args.get("end_line", 120)),
+        }
+        t_name = "read_file_window"
 
-    if t_name in ("read_file_window", "read_file"):
-        file_path = t_args.get("file_path") or t_args.get("path", "")
-        clean_path = str(file_path).replace("\\", "/").lstrip("/")
-        repo_root = settings.default_target_repo_path
-        target = repo_root / clean_path
-        if not target.is_file():
-            from pathlib import Path
-            for candidate in [repo_root / clean_path, repo_root / "app/services" / Path(clean_path).name]:
-                if candidate.is_file():
-                    target = candidate
-                    break
-        if not target.is_file():
-            return f"文件不存在: {file_path}"
-        lines = target.read_text(encoding="utf-8").splitlines()
-        s_line = int(t_args.get("start_line", 1))
-        e_line = int(t_args.get("end_line", len(lines)))
-        sliced = lines[max(0, s_line - 1) : e_line]
-        return "\n".join(f"{i + s_line}: {line}" for i, line in enumerate(sliced))
+    target_tool = tool_map.get(t_name)
+    if not target_tool:
+        return f"未找到外部工具或适配器: {t_name}"
 
-    if t_name == "git_blame_diff":
-        file_path = t_args.get("file_path", "")
-        clean_path = str(file_path).replace("\\", "/").lstrip("/")
-        repo_root = settings.default_target_repo_path
-        import subprocess
-        proc = subprocess.run(
-            ["git", "log", "-n", "3", "--stat", "--", clean_path],
-            cwd=str(repo_root),
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        return proc.stdout or f"文件 {clean_path} 近期未发现独立提交变更记录。"
+    # 3. 若当前运行上下文注入了特定 log_es_repo，设置上下文变量透传
+    log_es_repo = ctx.get("runtime_log_es_repo") if isinstance(ctx, dict) else getattr(ctx, "runtime_log_es_repo", None)
+    if log_es_repo is not None:
+        current_runtime_log_es_repo.set(log_es_repo)
 
-    return f"未找到外部工具或适配器: {t_name}"
+    try:
+        res = await target_tool.ainvoke(t_args)
+        return json.dumps(res, ensure_ascii=False, indent=2) if isinstance(res, (dict, list)) else str(res)
+    except Exception as exc:
+        return f"工具执行异常 ({t_name}): {exc}"
 
 
 async def probe_tool_node(

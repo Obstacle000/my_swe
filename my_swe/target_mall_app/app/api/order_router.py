@@ -33,12 +33,30 @@ async def post_orders_checkout_endpoint(dto: CheckoutRequestDTO) -> dict:
         discount_amount=dto.discount_amount,
         discount_rate=dto.discount_rate,
     )
-    final_amount = checkout_order(
-        user_id=dto.user_id,
-        total_price=dto.total_price,
-        coupon=coupon,
-    )
-    return {"code": 200, "user_id": dto.user_id, "final_price": final_amount}
+    try:
+        final_amount = checkout_order(
+            user_id=dto.user_id,
+            total_price=dto.total_price,
+            coupon=coupon,
+        )
+        return {"code": 200, "user_id": dto.user_id, "final_price": final_amount}
+    except Exception as exc:
+        import traceback
+        try:
+            from target_mall_app.app.logger import write_structured_log
+        except ImportError:
+            from app.logger import write_structured_log
+        write_structured_log(
+            level="ERROR",
+            service="mall-service",
+            api_path="/api/orders/checkout",
+            user_id=str(dto.user_id),
+            trace_id=f"tr_{dto.user_id}_checkout",
+            file_line="app/services/order_service.py:64",
+            message=f"订单结算异常 HTTP 500: {type(exc).__name__}: {exc}",
+            stacktrace=traceback.format_exc(),
+        )
+        raise
 
 
 @router.post("/api/orders/preview")
